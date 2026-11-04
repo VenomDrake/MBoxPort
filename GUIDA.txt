@@ -1,0 +1,74 @@
+MBOXPORT 1.0.1 — GUIDA RAPIDA
+
+Windows 10/11 a 64 bit. Non richiede Microsoft Outlook.
+
+INSTALLAZIONE
+Se disponibile, esegui MboxPort-1.0.1-Setup-x64.exe. L'installazione è personale e non
+richiede privilegi di amministratore. Include runtime e sorgenti.
+In alternativa estrai completamente lo ZIP Portatile e avvia MboxPort.exe.
+L'eseguibile non è firmato digitalmente.
+
+CONVERSIONE
+Scegli la lingua dal selettore nella finestra. Sono disponibili italiano,
+inglese, cinese semplificato, hindi, spagnolo, arabo, francese, bengalese,
+portoghese e indonesiano. La preferenza viene ricordata sul computer.
+
+1. Scegli un solo file MBOX, oppure trascinalo nella finestra.
+2. Seleziona una cartella di destinazione esistente.
+3. Mantieni 20 GB per suddividere gli archivi grandi; puoi scegliere 10 o 40.
+4. Premi Converti in PST.
+5. Al termine premi Apri risultati. Controlla il rapporto se ci sono avvisi
+   o messaggi saltati.
+
+Gli archivi di ingresso possono superare 20 GB. I PST vengono suddivisi in
+parti dalla dimensione indicativa scelta. I GB indicati corrispondono a GiB.
+Il file di origine viene letto senza modificarlo. Ogni conversione crea una
+nuova sottocartella e non riutilizza i file delle conversioni precedenti.
+
+RISULTATI
+Archivio.pst, oppure Archivio-1.pst, Archivio-2.pst, ecc.
+rapporto.txt: riepilogo in italiano e dettagli del motore in inglese.
+rapporto-dettagliato.json: avvisi e messaggi saltati con gli identificativi.
+sessione.json: riepilogo leggibile anche da altri programmi.
+
+ANNULLAMENTO
+Durante l'analisi non vengono creati PST. Durante la conversione viene
+eliminata la parte in corso; le eventuali parti già complete rimangono
+disponibili e sono elencate nel rapporto. Un risultato annullato è parziale.
+Il conteggio dei messaggi salvati riguarda soltanto i PST conservati.
+I messaggi eliminati con la parte incompleta sono indicati separatamente.
+Non è prevista la ripresa automatica: per riconvertire avvia una nuova sessione.
+
+ERRORI DI LETTURA
+Se non è possibile leggere tutto l'archivio, la conversione termina con un
+errore. Le eventuali parti conservate sono parziali. Apri i risultati e
+consulta il rapporto e il file ERRORE.txt, se il disco ha consentito di
+scriverli. Un messaggio saltato e una lettura interrotta sono esiti diversi.
+
+COMPATIBILITÀ
+MBOX standard e messaggi MIME, anche senza estensione. Per Aruba e altri
+fornitori è necessario scegliere l'esportazione MBOX standard, non ZIP,
+PST, EML singolo o un formato proprietario. I file ZIP vanno estratti prima.
+L'applicazione gestisce email e allegati. Un singolo MBOX non contiene
+necessariamente la struttura delle cartelle, gli stati e le etichette del
+programma di origine. Le email vengono inserite in “Posta importata”.
+Singoli messaggi oltre circa 1900 MiB vengono saltati e riportati.
+
+SPAZIO DISPONIBILE
+Usa una cartella con spazio per i PST e un disco con spazio anche per i
+temporanei degli allegati. Per file grandi usa NTFS o exFAT, non FAT32.
+
+SORGENTI E LICENZE
+Software libero GNU GPL versione 3 o successiva, senza garanzia.
+Il motore deriva da ContinuMail (Aksel Visby) e include PSTFileFormat
+(ROM Knowledgeware / Tal Aloni, LGPL). Attribuzioni complete incluse.
+Nella versione installata lo ZIP dei sorgenti si trova nella cartella
+"sorgenti" accanto a MboxPort.exe. Consulta README.md nello ZIP per
+modificare e ricompilare il programma.
+
+VALIDAZIONE
+Sono disponibili test automatici e una verifica indipendente su posta
+sintetica. Non è stato effettuato un collaudo completo su un MBOX reale
+superiore a 20 GB o su tutte le varianti di esportazione dei fornitori.
+Il conteggio corretto non prova da solo la resa visiva di ogni messaggio.
+Ulteriori dettagli in VALIDAZIONE.txt incluso nel pacchetto.

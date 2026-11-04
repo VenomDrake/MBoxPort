@@ -1,0 +1,44 @@
+bin/
+obj/
+*.user
+test_output.pst
+.worktrees/
+bench-output/
+takeout-bench.json
+testdata/
+
+# Rust validator (tools/pst-validate) build output — dev tool, never shipped or committed
+/tools/pst-validate/target/
+
+# Local test configs with machine-specific paths — never commit
+fixtures/full-mail-config.json
+fixtures/takeout-test-config.json
+
+# Visual-companion brainstorm artifacts (local only)
+.superpowers/
+
+# Root session-handoff scratch note (local-only)
+/SESSION-HANDOFF.md
+
+# Local manual-test output (PSTs / reports) — never commit
+_manualtest/
+
+# Private dev artifacts — single public-primary repo model (2026-06-18). Kept local on disk,
+# Stryker.NET mutation-testing output (regenerable; the run is driven by the committed
+# tests/Mail2Pst.Core.Tests/stryker-config.json — see TESTING.md).
+StrykerOutput/
+
+# OneDrive-synced, NEVER committed. The .githooks/ leak-check enforces this mechanically.
+docs/
+reviews/
+.claude-memory/
+.rules/
+CLAUDE.md
+todo.md
+/publish-smoke/
+
+# Graphify knowledge-graph output (dev tool; graph.json/report embed repo content incl.
+# private-dir excerpts if misconfigured — never commit) + its local ignore config
+graphify-out/
+.graphifyignore
+.claude/

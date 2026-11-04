@@ -1,0 +1,980 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tauri::path::BaseDirectory;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::ShellExt;
+
+// One in-flight sidecar run: the child handle (for cancel/kill), the per-run temp file to
+// clean up, and the spawn instant used to identify the run for cancel-kill escalation.
+struct RunningChild {
+    child: CommandChild,
+    temp_path: PathBuf,
+    started_at: Instant,
+}
+
+// Holds the single in-flight conversion. Lock only briefly — never across an .await.
+#[derive(Default)]
+struct ConvertState(Mutex<Option<RunningChild>>);
+
+// Holds the single in-flight scan. Lock only briefly — never across an .await.
+#[derive(Default)]
+struct ScanState(Mutex<Option<RunningChild>>);
+
+// Drain every complete (newline-terminated) line from `buf`, returning each with
+// trailing CR/LF stripped and empty lines skipped. Any trailing partial line is
+// left in `buf` for the next chunk. Used by both the scan and convert readers so
+// a JSON record that spans or batches across Stdout events is never dropped.
+fn drain_lines(buf: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(nl) = buf.find('\n') {
+        let line: String = buf.drain(..=nl).collect();
+        let line = line.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+// The exact CLI argument vector for a streaming scan. The GUI ALWAYS passes
+// `--progress` (the Rust reader consumes the advisory `scanProgress` lines plus
+// the final authoritative `scan` object). Pure + unit-tested so the contract the
+// sidecar is invoked with can't drift silently.
+// Scan inputs are handed to the engine via a temp file (--input-list) rather than
+// one --input argument per path: a Thunderbird profile can hold hundreds of mail
+// folders, and per-path args blew past the Windows 32,767-char CreateProcess limit
+// ("os error 206", GitHub issue #66).
+fn scan_args(input_list_path: &str) -> Vec<String> {
+    vec![
+        "scan".into(),
+        "--input-list".into(),
+        input_list_path.into(),
+        "--progress".into(),
+    ]
+}
+
+/// The --input-list file body: one path per line, read verbatim by the CLI. The
+/// line-based format cannot represent a path containing a newline — fine here
+/// because Windows (the only GUI platform) forbids newlines in file names.
+fn scan_input_list_content(paths: &[String]) -> String {
+    let mut content = paths.join("\n");
+    content.push('\n');
+    content
+}
+
+// A unique temp-file path (`continumail-<kind>-<pid>-<nanos><ext>`): the per-run
+// name avoids collisions with stale files / a second app instance. Shared by
+// start_scan (input list) and start_convert (config).
+fn unique_temp_path(kind: &str, ext: &str) -> std::path::PathBuf {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    std::env::temp_dir().join(format!("continumail-{kind}-{unique}{ext}"))
+}
+
+/// Remove a per-run temp file, ignoring a missing file. Idempotent: the reader (normal exit),
+/// the cancel/escalation paths, and the app-exit handler can each try to remove the same path
+/// and race — a double remove is harmless.
+fn remove_temp_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// How long cancel_convert waits after writing `cancel` before force-killing a sidecar that
+/// hasn't terminated on its own (KB-004 cap). Long enough for a normal cancel to flush and
+/// delete the in-progress PST part, short enough to unwedge a stuck engine quickly.
+const CANCEL_KILL_CAP: Duration = Duration::from_secs(10);
+
+/// True when the run currently in the slot is the same one whose cancel we're escalating
+/// (identified by its spawn instant), so the timed kill can never hit a later run that
+/// started after the cancelled one already finished.
+fn same_run(current: Option<Instant>, cancelled_at: Instant) -> bool {
+    current == Some(cancelled_at)
+}
+
+/// On app exit, kill any in-flight sidecar and remove its temp file so closing the window mid-run
+/// never orphans the engine process or leaks the temp config/input-list.
+fn kill_running_children(app: &AppHandle) {
+    if let Some(rc) = app
+        .state::<ConvertState>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let _ = rc.child.kill();
+        remove_temp_file(&rc.temp_path);
+    }
+    if let Some(rc) = app
+        .state::<ScanState>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let _ = rc.child.kill();
+        remove_temp_file(&rc.temp_path);
+    }
+}
+
+// The exact CLI argument vector for a conversion run. `expected_total`, when present,
+// passes the GUI's already-known message count so the engine skips its convert-time
+// boundary count pass; None preserves the count-on-demand behaviour. Some(0) is valid.
+fn convert_args(config_path: &str, output_dir: &str, expected_total: Option<i32>) -> Vec<String> {
+    let mut args = vec![
+        "convert".into(),
+        "--config".into(),
+        config_path.into(),
+        "--output".into(),
+        output_dir.into(),
+    ];
+    if let Some(n) = expected_total {
+        args.push("--expected-total".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
+async fn run_sidecar(app: &tauri::AppHandle, args: Vec<String>) -> Result<String, String> {
+    let output = app
+        .shell()
+        .sidecar("mail2pst-cli")
+        .map_err(|e| format!("sidecar not found: {e}"))?
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run engine: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "engine exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[tauri::command]
+async fn check_engine_version(app: tauri::AppHandle) -> Result<String, String> {
+    run_sidecar(&app, vec!["--version".to_string()]).await
+}
+
+#[tauri::command]
+async fn scan_sample(app: tauri::AppHandle) -> Result<String, String> {
+    let sample = app
+        .path()
+        .resolve("resources/sample.mbox", BaseDirectory::Resource)
+        .map_err(|e| format!("could not resolve bundled sample: {e}"))?;
+    let sample = sample.to_string_lossy().to_string();
+    run_sidecar(
+        &app,
+        vec!["scan".to_string(), "--input".to_string(), sample],
+    )
+    .await
+}
+
+#[tauri::command]
+async fn discover_profile(app: tauri::AppHandle, dir: String) -> Result<String, String> {
+    run_sidecar(&app, vec!["discover".to_string(), "--input".to_string(), dir]).await
+}
+
+#[derive(Serialize)]
+struct FileStat {
+    path: String,
+    size: u64,
+}
+
+#[tauri::command]
+fn stat_files(paths: Vec<String>) -> Vec<FileStat> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            FileStat { path, size }
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn start_scan(
+    app: AppHandle,
+    paths: Vec<String>,
+    state: State<'_, ScanState>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("No files to scan.".into());
+    }
+    // Reject a second concurrent scan.
+    if state.0.lock().unwrap().is_some() {
+        return Err("A scan is already running.".into());
+    }
+
+    // Write the input paths to a unique temp file the sidecar will read.
+    let list_path = unique_temp_path("scan-inputs", ".txt");
+    std::fs::write(&list_path, scan_input_list_content(&paths))
+        .map_err(|e| format!("cannot write input list: {e}"))?;
+    let list_path_str = list_path.to_string_lossy().to_string();
+
+    // On any failure to launch the sidecar, remove the temp list we just wrote — the
+    // async reader task (which owns cleanup on normal exit) never starts in that case.
+    let (mut rx, child) = app
+        .shell()
+        .sidecar("mail2pst-cli")
+        .map_err(|e| {
+            remove_temp_file(&list_path);
+            format!("sidecar not found: {e}")
+        })?
+        .args(scan_args(&list_path_str))
+        .spawn()
+        .map_err(|e| {
+            remove_temp_file(&list_path);
+            format!("failed to start engine: {e}")
+        })?;
+
+    // Store the child BEFORE the reader task starts.
+    *state.0.lock().unwrap() = Some(RunningChild {
+        child,
+        temp_path: list_path.clone(),
+        started_at: Instant::now(),
+    });
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Buffer stdout and split on newlines — do NOT assume each Stdout event
+        // is exactly one JSON line (a record may span events or arrive batched).
+        let mut buf = String::new();
+        let mut terminated = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    for line in drain_lines(&mut buf) {
+                        let _ = app_for_task.emit("scan://line", line);
+                    }
+                }
+                CommandEvent::Stderr(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes).to_string();
+                    let _ = app_for_task.emit("scan://stderr", line);
+                }
+                CommandEvent::Terminated(payload) => {
+                    terminated = true;
+                    // Flush any trailing partial line (no terminating newline).
+                    let rest = buf.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+                    if !rest.is_empty() {
+                        let _ = app_for_task.emit("scan://line", rest);
+                    }
+                    buf.clear();
+                    *app_for_task.state::<ScanState>().0.lock().unwrap() = None;
+                    remove_temp_file(&list_path);
+                    let _ = app_for_task.emit("scan://exit", payload.code);
+                }
+                _ => {}
+            }
+        }
+        // Defensive: if the stream ended WITHOUT a Terminated event, no exit was
+        // emitted and the frontend Promise would hang forever. Flush any partial
+        // line, clear the slot + temp file, and emit a synthetic failure so it rejects.
+        if !terminated {
+            let rest = buf.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+            if !rest.is_empty() {
+                let _ = app_for_task.emit("scan://line", rest);
+            }
+            *app_for_task.state::<ScanState>().0.lock().unwrap() = None;
+            remove_temp_file(&list_path);
+            let _ = app_for_task.emit(
+                "scan://stderr",
+                "Scan process ended without a termination event.".to_string(),
+            );
+            let _ = app_for_task.emit("scan://exit", -1_i32);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_convert(
+    app: AppHandle,
+    config: serde_json::Value,
+    output_dir: String,
+    expected_total: Option<i32>,
+    state: State<'_, ConvertState>,
+) -> Result<(), String> {
+    // Reject a second concurrent run.
+    if state.0.lock().unwrap().is_some() {
+        return Err("A conversion is already running.".into());
+    }
+
+    // Write the config to a unique temp file the sidecar will read.
+    let config_path = unique_temp_path("convert-config", ".json");
+    let config_text = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, config_text).map_err(|e| format!("cannot write config: {e}"))?;
+    let config_path_str = config_path.to_string_lossy().to_string();
+
+    // On any failure to launch the sidecar, remove the temp config we just wrote — the
+    // async reader task (which owns cleanup on normal exit) never starts in that case.
+    let (mut rx, child) = app
+        .shell()
+        .sidecar("mail2pst-cli")
+        .map_err(|e| {
+            remove_temp_file(&config_path);
+            format!("sidecar not found: {e}")
+        })?
+        .args(convert_args(&config_path_str, &output_dir, expected_total))
+        .spawn()
+        .map_err(|e| {
+            remove_temp_file(&config_path);
+            format!("failed to start engine: {e}")
+        })?;
+
+    // Store the child BEFORE the reader task starts.
+    *state.0.lock().unwrap() = Some(RunningChild {
+        child,
+        temp_path: config_path.clone(),
+        started_at: Instant::now(),
+    });
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Buffer stdout and split on newlines — do NOT assume each Stdout event is
+        // exactly one JSON line (a record may span events or arrive batched).
+        let mut buf = String::new();
+        let mut terminated = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    for line in drain_lines(&mut buf) {
+                        let _ = app_for_task.emit("convert://line", line);
+                    }
+                }
+                CommandEvent::Stderr(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes).to_string();
+                    let _ = app_for_task.emit("convert://stderr", line);
+                }
+                CommandEvent::Terminated(payload) => {
+                    terminated = true;
+                    // Flush any trailing partial line (no terminating newline).
+                    let rest = buf.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+                    if !rest.is_empty() {
+                        let _ = app_for_task.emit("convert://line", rest);
+                    }
+                    buf.clear();
+                    *app_for_task.state::<ConvertState>().0.lock().unwrap() = None;
+                    remove_temp_file(&config_path);
+                    let _ = app_for_task.emit("convert://exit", payload.code);
+                }
+                _ => {}
+            }
+        }
+        // Defensive: if the stream ended WITHOUT a Terminated event, flush any
+        // partial line, clear the slot + temp file, and emit a synthetic failure
+        // so the frontend can't hang forever.
+        if !terminated {
+            let rest = buf.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+            if !rest.is_empty() {
+                let _ = app_for_task.emit("convert://line", rest);
+            }
+            *app_for_task.state::<ConvertState>().0.lock().unwrap() = None;
+            remove_temp_file(&config_path);
+            let _ = app_for_task.emit("convert://exit", -1_i32);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_convert(app: AppHandle, state: State<'_, ConvertState>) -> Result<(), String> {
+    // Graceful cancel first: the engine deletes the in-progress PST part and emits `cancelled`.
+    // Best-effort write: if stdin is closed/unresponsive we do NOT bail — the escalation timer
+    // below still force-kills this run after the cap, so the slot always recovers.
+    let cancelled_at = {
+        let mut guard = state.0.lock().unwrap();
+        match guard.as_mut() {
+            Some(rc) => {
+                let _ = rc.child.write(b"cancel\n");
+                rc.started_at
+            }
+            None => return Err("No conversion is running.".into()),
+        }
+    }; // lock released here — never held across the .await below
+
+    // Escalate: if the same run is still in the slot after the cap (engine ignored cancel /
+    // wedged), force-kill it and clear the slot so the user isn't locked out.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CANCEL_KILL_CAP).await;
+        let state = app.state::<ConvertState>();
+        let mut guard = state.0.lock().unwrap();
+        if same_run(guard.as_ref().map(|rc| rc.started_at), cancelled_at) {
+            if let Some(rc) = guard.take() {
+                let _ = rc.child.kill();
+                remove_temp_file(&rc.temp_path);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_scan(state: State<'_, ScanState>) -> Result<(), String> {
+    // Scan has no stdin cancel protocol, so recovery is a hard kill: take the child out of the
+    // slot, kill it, and remove its temp input-list. Frees a wedged scan so a new one can start.
+    match state.0.lock().unwrap().take() {
+        Some(rc) => {
+            let _ = rc.child.kill();
+            remove_temp_file(&rc.temp_path);
+            Ok(())
+        }
+        None => Err("No scan is running.".into()),
+    }
+}
+
+#[tauri::command]
+fn open_folder(app: AppHandle, path: String) -> Result<(), String> {
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("could not open folder: {e}"))
+}
+
+#[tauri::command]
+fn open_junk_help(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(
+            "https://support.mozilla.org/en-US/kb/thunderbird-and-junk-spam-messages",
+            None::<&str>,
+        )
+        .map_err(|e| format!("could not open link: {e}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileEntry {
+    name: String,
+    path: String,
+    is_default: bool,
+    accounts: Vec<String>,
+    convertible: bool,
+}
+
+/// Parse profiles.ini. `tb_root` = the Thunderbird dir (parent of Profiles/). Pure + testable.
+fn parse_profiles_ini(content: &str, tb_root: &std::path::Path) -> Vec<ProfileEntry> {
+    let mut defaults: Vec<String> = Vec::new();
+    let mut profiles: Vec<(String, String, bool, Option<String>)> = Vec::new();
+    let mut sec = String::new();
+    let (mut name, mut path, mut is_rel, mut sec_default) =
+        (None::<String>, None::<String>, true, None::<String>);
+
+    for line in content.lines() {
+        let l = line.trim();
+        if l.starts_with('[') && l.ends_with(']') {
+            if sec.starts_with("Profile") {
+                if let (Some(n), Some(p)) = (name.take(), path.take()) {
+                    profiles.push((n, p, is_rel, sec_default.take()));
+                }
+            }
+            sec = l[1..l.len() - 1].to_string();
+            name = None;
+            path = None;
+            is_rel = true;
+            sec_default = None;
+            continue;
+        }
+        let Some((k, v)) = l.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if sec.starts_with("Install") && k == "Default" {
+            defaults.push(v.replace('\\', "/"));
+        } else if sec.starts_with("Profile") {
+            match k {
+                "Name" => name = Some(v.to_string()),
+                "Path" => path = Some(v.to_string()),
+                "IsRelative" => is_rel = v == "1",
+                "Default" if v == "1" => sec_default = Some("1".into()),
+                _ => {}
+            }
+        }
+    }
+    if sec.starts_with("Profile") {
+        if let (Some(n), Some(p)) = (name.take(), path.take()) {
+            profiles.push((n, p, is_rel, sec_default.take()));
+        }
+    }
+
+    profiles
+        .into_iter()
+        .map(|(name, raw, is_rel, sd)| {
+            let abs = if is_rel {
+                tb_root.join(&raw).to_string_lossy().to_string()
+            } else {
+                raw.clone()
+            };
+            let norm = raw.replace('\\', "/");
+            let is_default = sd.is_some() || defaults.iter().any(|d| d.as_str() == norm);
+            ProfileEntry { name, path: abs, is_default, accounts: Vec::new(), convertible: false }
+        })
+        .collect()
+}
+
+/// Parse mail.identity.*.useremail values from prefs.js. Pure. Case-insensitive dedupe, keep first.
+fn parse_identity_emails(prefs: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in prefs.lines() {
+        let l = line.trim_start();
+        if !l.starts_with("user_pref(") { continue; }
+        let Some((key_raw, val_raw)) = two_quoted(l) else { continue; };
+        if !(key_raw.starts_with("mail.identity.") && key_raw.ends_with(".useremail")) { continue; }
+        let mid = &key_raw["mail.identity.".len()..key_raw.len() - ".useremail".len()];
+        if mid.is_empty() || mid.contains('.') { continue; }
+        let Some(v) = prefs_unescape(&val_raw) else { continue; };
+        let v = v.trim().to_string();
+        if v.is_empty() { continue; }
+        if seen.insert(v.to_lowercase()) { out.push(v); }
+    }
+    out
+}
+
+/// Raw contents (escapes intact) of the first two double-quoted strings on a line, or None.
+fn two_quoted(s: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut found: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && found.len() < 2 {
+        if chars[i] != '"' { i += 1; continue; }
+        i += 1;
+        let mut buf = String::new();
+        loop {
+            if i >= chars.len() { return None; }
+            let c = chars[i];
+            if c == '\\' {
+                if i + 1 >= chars.len() { return None; }
+                buf.push(c); buf.push(chars[i + 1]); i += 2; continue;
+            }
+            if c == '"' { i += 1; break; }
+            buf.push(c); i += 1;
+        }
+        found.push(buf);
+    }
+    if found.len() == 2 { Some((found.remove(0), found.remove(0))) } else { None }
+}
+
+/// Unescape a prefs.js double-quoted value. None on dangling/unknown escape.
+fn prefs_unescape(raw: &str) -> Option<String> {
+    let mut s = String::with_capacity(raw.len());
+    let mut it = raw.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\\' { s.push(ch); continue; }
+        match it.next()? {
+            '\\' => s.push('\\'), '"' => s.push('"'),
+            'n' => s.push('\n'), 'r' => s.push('\r'), 't' => s.push('\t'),
+            'u' => {
+                let hex: String = (0..4).map(|_| it.next()).collect::<Option<String>>()?;
+                let cp = u32::from_str_radix(&hex, 16).ok()?;
+                s.push(char::from_u32(cp)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(s)
+}
+
+fn is_convertible(email_count: usize, has_mail_store: bool) -> bool { email_count > 0 || has_mail_store }
+
+/// True if Mail/ or ImapMail/ recursively contains a non-dir, non-.msf file.
+fn has_mail_store(profile_dir: &std::path::Path) -> bool {
+    ["Mail", "ImapMail"].iter().any(|s| dir_has_mailbox_file(&profile_dir.join(s)))
+}
+
+fn dir_has_mailbox_file(dir: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false; };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() { if dir_has_mailbox_file(&p) { return true; } }
+        else if p.extension().and_then(|e| e.to_str()) != Some("msf") { return true; }
+    }
+    false
+}
+
+#[tauri::command]
+fn list_thunderbird_profiles() -> Result<Vec<ProfileEntry>, String> {
+    let appdata = match std::env::var_os("APPDATA") {
+        Some(v) => std::path::PathBuf::from(v),
+        None => return Ok(vec![]),
+    };
+    let tb = appdata.join("Thunderbird");
+    let ini = tb.join("profiles.ini");
+    let content = match std::fs::read_to_string(&ini) {
+        Ok(c) => c,
+        Err(_) => return Ok(vec![]),
+    };
+    let mut out = Vec::new();
+    for e in parse_profiles_ini(&content, &tb) {
+        let dir = std::path::Path::new(&e.path);
+        let accounts = std::fs::read_to_string(dir.join("prefs.js"))
+            .map(|p| parse_identity_emails(&p))
+            .unwrap_or_default();
+        let convertible = is_convertible(accounts.len(), has_mail_store(dir));
+        out.push(ProfileEntry { name: e.name, path: e.path, is_default: e.is_default, accounts, convertible });
+    }
+    Ok(out)
+}
+
+/// Returns %APPDATA%\Thunderbird\Profiles when it exists, else None. Windows-only app.
+#[tauri::command]
+fn default_thunderbird_profiles_dir() -> Result<Option<String>, String> {
+    let appdata = match std::env::var_os("APPDATA") {
+        Some(v) => std::path::PathBuf::from(v),
+        None => return Ok(None),
+    };
+    let dir = appdata.join("Thunderbird").join("Profiles");
+    Ok(if dir.is_dir() { Some(dir.to_string_lossy().to_string()) } else { None })
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .manage(ConvertState::default())
+        .manage(ScanState::default())
+        .invoke_handler(tauri::generate_handler![
+            check_engine_version,
+            scan_sample,
+            discover_profile,
+            stat_files,
+            start_convert,
+            start_scan,
+            cancel_convert,
+            cancel_scan,
+            open_folder,
+            open_junk_help,
+            default_thunderbird_profiles_dir,
+            list_thunderbird_profiles
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            kill_running_children(app_handle);
+        }
+    });
+}
+
+#[cfg(test)]
+mod profile_scan_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parse_emails_dedupes_case_insensitively_keeping_first() {
+        let p = "\
+user_pref(\"mail.identity.id1.useremail\", \"Alice@EXAMPLE.com\");\n\
+user_pref(\"mail.identity.id2.useremail\", \"alice@example.com\");\n\
+user_pref(\"mail.identity.id3.useremail\", \"bob@example.test\");\n\
+user_pref(\"mail.identity.id4.fullName\", \"Not An Email\");\n";
+        assert_eq!(parse_identity_emails(p), vec!["Alice@EXAMPLE.com", "bob@example.test"]);
+    }
+
+    #[test]
+    fn parse_emails_unescapes_and_skips_malformed() {
+        let p = "\
+user_pref(\"mail.identity.id1.useremail\", \"al\\u00e6ce@example.com\");\n\
+user_pref(\"mail.identity.id2.useremail\", \"bad\\xZZ@example.com\");\n\
+user_pref(\"mail.identity.id3.useremail\", \"   \");\n";
+        assert_eq!(parse_identity_emails(p), vec!["alæce@example.com"]); // id2 skipped (bad escape), id3 empty
+    }
+
+    #[test]
+    fn convertible_truth_table() {
+        assert!(is_convertible(1, false));
+        assert!(is_convertible(0, true));
+        assert!(!is_convertible(0, false));
+    }
+
+    #[test]
+    fn mail_store_detection() {
+        let root = std::env::temp_dir().join(format!("cm-mailstore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let a = root.join("a"); fs::create_dir_all(a.join("Mail/Local Folders")).unwrap();
+        fs::write(a.join("Mail/Local Folders/Inbox"), b"x").unwrap();
+        assert!(has_mail_store(&a));
+        let b = root.join("b"); fs::create_dir_all(b.join("Mail/Local Folders")).unwrap();
+        fs::write(b.join("Mail/Local Folders/Inbox.msf"), b"x").unwrap();
+        assert!(!has_mail_store(&b));
+        let c = root.join("c"); fs::create_dir_all(c.join("Mail/Local Folders/Archives.sbd")).unwrap();
+        fs::write(c.join("Mail/Local Folders/Archives.sbd/2024"), b"x").unwrap();
+        assert!(has_mail_store(&c));
+        let d = root.join("d"); fs::create_dir_all(d.join("ImapMail/acct")).unwrap();
+        fs::write(d.join("ImapMail/acct/INBOX"), b"x").unwrap();
+        assert!(has_mail_store(&d));
+        let e = root.join("e"); fs::create_dir_all(e.join("Mail")).unwrap(); fs::create_dir_all(e.join("ImapMail")).unwrap();
+        assert!(!has_mail_store(&e));
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod profiles_ini_tests {
+    use super::*;
+    use std::path::Path;
+
+    const INI: &str = "\
+[Install4F96D1932A9F858E]\n\
+Default=Profiles/abc.default-release\n\
+\n\
+[Profile0]\n\
+Name=default-release\n\
+IsRelative=1\n\
+Path=Profiles/abc.default-release\n\
+\n\
+[Profile1]\n\
+Name=dev\n\
+IsRelative=1\n\
+Path=Profiles/xyz.dev\n";
+
+    #[test]
+    fn parses_profiles_and_marks_default() {
+        let out = parse_profiles_ini(INI, Path::new("C:/TB"));
+        assert_eq!(out.len(), 2);
+        let def = out.iter().find(|p| p.is_default).unwrap();
+        assert_eq!(def.name, "default-release");
+        assert!(def.path.ends_with("Profiles/abc.default-release") || def.path.ends_with("Profiles\\abc.default-release"));
+        assert!(!out.iter().find(|p| p.name == "dev").unwrap().is_default);
+    }
+
+    #[test]
+    fn empty_content_yields_empty() {
+        assert!(parse_profiles_ini("", Path::new("C:/x")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_temp_file_is_idempotent() {
+        let p = std::env::temp_dir().join(format!("cm-lifecycle-rm-{}.tmp", std::process::id()));
+        std::fs::write(&p, b"x").unwrap();
+        assert!(p.exists());
+        remove_temp_file(&p);
+        assert!(!p.exists());
+        remove_temp_file(&p); // second call on a missing file must not panic or error
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn same_run_matches_only_identical_start_instant() {
+        let t = std::time::Instant::now();
+        assert!(same_run(Some(t), t)); // same run still in the slot
+        assert!(!same_run(None, t)); // slot already cleared (ran to completion)
+        let later = t + std::time::Duration::from_secs(1);
+        assert!(!same_run(Some(later), t)); // a different (later) run now occupies the slot
+    }
+
+    // Scan inputs travel via a temp file (--input-list), NOT as one command-line
+    // argument per path: a Thunderbird profile can hold hundreds of mail folders,
+    // and repeated --input args blew past the Windows 32,767-char CreateProcess
+    // limit ("os error 206", GitHub issue #66).
+    #[test]
+    fn scan_args_passes_input_list_file_and_progress_flag() {
+        assert_eq!(
+            scan_args("C:/tmp/inputs.txt"),
+            vec!["scan", "--input-list", "C:/tmp/inputs.txt", "--progress"]
+        );
+    }
+
+    #[test]
+    fn scan_input_list_content_is_one_path_per_line() {
+        assert_eq!(
+            scan_input_list_content(&["a.mbox".to_string(), "b.mbox".to_string()]),
+            "a.mbox\nb.mbox\n"
+        );
+    }
+
+    #[test]
+    fn convert_args_without_expected_total_omits_flag() {
+        assert_eq!(
+            convert_args("C:/tmp/cfg.json", "C:/out", None),
+            vec!["convert", "--config", "C:/tmp/cfg.json", "--output", "C:/out"]
+        );
+    }
+
+    #[test]
+    fn convert_args_with_expected_total_appends_flag() {
+        assert_eq!(
+            convert_args("C:/tmp/cfg.json", "C:/out", Some(123)),
+            vec!["convert", "--config", "C:/tmp/cfg.json", "--output", "C:/out", "--expected-total", "123"]
+        );
+    }
+
+    #[test]
+    fn convert_args_with_zero_expected_total_still_appends_flag() {
+        // 0 is a valid precomputed total (empty-but-valid conversion); only None omits it.
+        assert_eq!(
+            convert_args("C:/tmp/cfg.json", "C:/out", Some(0)),
+            vec!["convert", "--config", "C:/tmp/cfg.json", "--output", "C:/out", "--expected-total", "0"]
+        );
+    }
+
+    #[test]
+    fn drain_lines_splits_batched_records_and_keeps_partial() {
+        // Two complete records arrive batched in one chunk, plus a partial third
+        // with no terminating newline.
+        let mut buf = String::from("{\"type\":\"started\"}\n{\"type\":\"progress\"}\n{\"type\":\"do");
+        let lines = drain_lines(&mut buf);
+        assert_eq!(lines, vec!["{\"type\":\"started\"}", "{\"type\":\"progress\"}"]);
+        // The incomplete record is left in the buffer for the next chunk.
+        assert_eq!(buf, "{\"type\":\"do");
+
+        // The rest of the record arrives; now it drains as one complete line.
+        buf.push_str("ne\"}\n");
+        let lines = drain_lines(&mut buf);
+        assert_eq!(lines, vec!["{\"type\":\"done\"}"]);
+        assert_eq!(buf, "");
+    }
+
+    #[test]
+    fn drain_lines_strips_crlf_and_skips_empty_lines() {
+        let mut buf = String::from("a\r\n\r\nb\n");
+        let lines = drain_lines(&mut buf);
+        assert_eq!(lines, vec!["a", "b"]);
+        assert_eq!(buf, "");
+    }
+}
+
+// Exercises the REAL CLI sidecar the GUI spawns, proving the JSON-Lines contract the
+// Rust readers depend on: every emitted line is JSON carrying `schemaVersion`; a
+// `scan --progress` stream ends with the authoritative single `scan` object; advisory
+// `scanProgress` lines clamp `bytes` to `totalBytes`. Locates the published Tauri
+// sidecar binary, else falls back to the dotnet build output; SKIPS (no failure) if
+// neither is present (a checkout where the engine hasn't been built). Run with
+// `cargo test` — not currently wired into CI (see roadmap: add a cargo-test job).
+#[cfg(test)]
+mod sidecar_integration_tests {
+    use super::{drain_lines, scan_args, scan_input_list_content};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn manifest() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    // (program, leading args) to invoke the CLI, or None if no build is present.
+    fn locate_cli() -> Option<(String, Vec<String>)> {
+        // 1) Published Tauri sidecar: binaries/mail2pst-cli-<target-triple>[.exe]
+        if let Ok(entries) = std::fs::read_dir(manifest().join("binaries")) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("mail2pst-cli") && (name.ends_with(".exe") || !name.contains('.')) {
+                    return Some((e.path().to_string_lossy().to_string(), vec![]));
+                }
+            }
+        }
+        // 2) Fallback: run the dotnet build output directly.
+        for cfg in ["Debug", "Release"] {
+            let dll = manifest()
+                .join("../../src/Mail2Pst.Cli/bin")
+                .join(cfg)
+                .join("net8.0/Mail2Pst.Cli.dll");
+            if dll.exists() {
+                return Some(("dotnet".to_string(), vec![dll.to_string_lossy().to_string()]));
+            }
+        }
+        None
+    }
+
+    fn run(program: &str, lead: &[String], args: &[String]) -> (i32, Vec<String>) {
+        let out = Command::new(program)
+            .args(lead)
+            .args(args)
+            .output()
+            .expect("failed to spawn CLI");
+        let mut buf = String::from_utf8_lossy(&out.stdout).to_string();
+        if !buf.ends_with('\n') {
+            buf.push('\n'); // ensure a final unterminated line still drains
+        }
+        (out.status.code().unwrap_or(-1), drain_lines(&mut buf))
+    }
+
+    #[test]
+    fn version_emits_one_versioned_json_line() {
+        let Some((prog, lead)) = locate_cli() else {
+            eprintln!("skipping: no CLI build found (sidecar binary or dotnet dll)");
+            return;
+        };
+        let (code, lines) = run(&prog, &lead, &["version".to_string()]);
+        assert_eq!(code, 0, "version should exit 0");
+        assert_eq!(lines.len(), 1, "version prints exactly one line");
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).expect("version line is JSON");
+        assert_eq!(v["type"], "version");
+        assert!(v["schemaVersion"].as_i64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn scan_progress_stream_is_jsonlines_and_ends_with_scan() {
+        let Some((prog, lead)) = locate_cli() else {
+            eprintln!("skipping: no CLI build found (sidecar binary or dotnet dll)");
+            return;
+        };
+        let sample = manifest().join("../../fixtures/sample.mbox");
+        if !sample.exists() {
+            eprintln!("skipping: fixtures/sample.mbox not found");
+            return;
+        }
+
+        // Exercise the REAL contract: paths go via a temp --input-list file,
+        // exactly as start_scan hands them to the sidecar.
+        let list_path = std::env::temp_dir().join(format!(
+            "continumail-scan-inputs-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &list_path,
+            scan_input_list_content(&[sample.to_string_lossy().to_string()]),
+        )
+        .expect("write input list");
+
+        let args = scan_args(&list_path.to_string_lossy());
+        let (code, lines) = run(&prog, &lead, &args);
+        let _ = std::fs::remove_file(&list_path);
+        assert_eq!(code, 0, "scan should exit 0");
+        assert!(!lines.is_empty(), "scan --progress emits at least the final scan line");
+
+        for line in &lines {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}"));
+            assert!(
+                v["schemaVersion"].as_i64().unwrap_or(0) >= 1,
+                "line missing schemaVersion: {line}"
+            );
+            if v["type"] == "scanProgress" {
+                let b = v["bytes"].as_i64().unwrap_or(0);
+                let t = v["totalBytes"].as_i64().unwrap_or(0);
+                assert!(b <= t, "scanProgress bytes {b} exceeds total {t}");
+            }
+        }
+
+        // The LAST line is the authoritative single `scan` object.
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "scan", "final line must be the scan result");
+        assert!(last["totals"]["messages"].as_i64().unwrap_or(-1) >= 0);
+    }
+}

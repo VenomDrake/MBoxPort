@@ -1,0 +1,524 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using Mail2Pst.Core.Calendar;
+using Mail2Pst.Core.Config;
+using Mail2Pst.Core.Contacts;
+using Mail2Pst.Core.Diagnostics;
+using Mail2Pst.Core.Mapping;
+using Mail2Pst.Core.Models;
+using Mail2Pst.Core.Msf;
+using Mail2Pst.Core.OutlookCategories;
+using Mail2Pst.Core.Parsing;
+using Mail2Pst.Core.Progress;
+using Mail2Pst.Core.Reporting;
+using Mail2Pst.Core.Writing;
+using Microsoft.Data.Sqlite;
+
+namespace Mail2Pst.Core;
+
+/// <summary>
+/// Ties together config -> mapping plan -> parsing -> PST writing -> report
+/// for a full conversion run.
+/// </summary>
+public class ConversionRunner
+{
+    private readonly PstWriter _writer;
+    private readonly Func<string, IMailSourceParser> _getParser;
+
+    public ConversionRunner(int checkIntervalMessages = 500, int progressIntervalMessages = 25)
+        : this(new PstWriter(checkIntervalMessages, progressIntervalMessages), ParserRegistry.Get)
+    {
+    }
+
+    internal ConversionRunner(PstWriter writer, Func<string, IMailSourceParser> getParser)
+    {
+        _writer = writer ?? throw new ArgumentNullException(nameof(writer));
+        _getParser = getParser ?? throw new ArgumentNullException(nameof(getParser));
+    }
+
+    public ConversionReport Run(ConversionConfig config, string outputDirectory, Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default, DurableMemoryObserver? memoryObserver = null, int precomputedTotalMessages = -1, bool skipTasks = false, bool skipAppointments = false)
+    {
+        // Validate the config up front (output names, duplicates, sizes, sources)
+        // so problems fail loudly before any output file is created.
+        ConfigValidator.Validate(config);
+
+        var report = new ConversionReport();
+        List<PstOutputPlan> plans = MappingEngine.BuildPlan(config);
+
+        // Mirror-mode planning warnings (folder-name sanitization / collision disambiguation). Recorded
+        // into the report now; the live WarningEvents are emitted after the ScanEvent below so the
+        // documented event order (scan before any warning) is preserved.
+        var planningWarnings = plans.SelectMany(p => p.PlanningWarnings).ToList();
+        foreach (string planningWarning in planningWarnings)
+            report.RecordWarning(new SourceReference { SourcePath = "", Identifier = "(mapping)" }, planningWarning);
+
+        var enrichmentOptions = new MsfEnrichmentOptions
+        {
+            TagResolver = MsfTagResolverFactory.Create(config.ProfilePath),
+            JunkHandling = config.JunkHandling,
+            DropExpunged = config.DropExpunged,
+        };
+
+        // Validate source types eagerly so an unsupported type fails loudly
+        // before any output file is created, rather than mid-write.
+        foreach (PstOutputPlan plan in plans)
+        {
+            foreach (SourceMapping mapping in plan.SourceMappings)
+            {
+                _getParser(mapping.Source.Type);
+            }
+        }
+
+        int total = 0;
+        if (onProgress is not null)
+        {
+            if (precomputedTotalMessages >= 0)
+            {
+                // A caller that already counted (e.g. the GUI's preceding `scan`) passes the total here,
+                // so a progress-mode convert skips a full second boundary pass over every source. When
+                // omitted (-1, the default and the direct-CLI path) we count on demand as before.
+                total = precomputedTotalMessages;
+            }
+            else
+            {
+                foreach (PstOutputPlan plan in plans)
+                {
+                    foreach (SourceMapping mapping in plan.SourceMappings)
+                    {
+                        try
+                        {
+                            total += _getParser(mapping.Source.Type).CountMessages(mapping.Source.Path);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            throw new SourceReadException(mapping.Source.Path, ex);
+                        }
+                    }
+                }
+            }
+            onProgress(new ScanEvent(total));
+
+            foreach (string planningWarning in planningWarnings)
+                onProgress(new WarningEvent("", "(mapping)", planningWarning));
+        }
+
+        // Track whether the "X disabled by --no-X" warning has already been emitted
+        // so each is emitted exactly once even when multiple output groups carry those mappings.
+        bool noTasksWarned = false;
+        bool noAppointmentsWarned = false;
+
+        // Phase-1 assembly bundle: everything WritePlan needs for one output group, gathered
+        // before ANY group is written, so the baked colour FAI (computed once, after all groups
+        // are assembled) can be handed to every group's WritePlan call in phase 2.
+        var bundles = new List<(
+            PstOutputPlan Plan,
+            IEnumerable<PlannedMessage> PlannedMessages,
+            List<PlannedContact> Planned,
+            List<IReadOnlyList<string>> ContactFolders,
+            List<PlannedTask> PlannedTasks,
+            List<IReadOnlyList<string>> TaskFolders,
+            List<PlannedAppointment> PlannedAppointments,
+            List<IReadOnlyList<string>> AppointmentFolders)>();
+
+        try
+        {
+            foreach (PstOutputPlan plan in plans)
+            {
+                IEnumerable<PlannedMessage> plannedMessages = EnumeratePlannedMessages(plan, report, enrichmentOptions, onProgress);
+
+                // Assemble contacts for this output group before handing off to the writer.
+                var planned = new List<PlannedContact>();
+                var contactFolders = new List<IReadOnlyList<string>>();
+                foreach (ContactMapping cm in plan.ContactMappings)
+                {
+                    contactFolders.Add(cm.TargetFolderPath);
+                    IAddressBookReader reader = cm.Format == AddressBookFormat.ThunderbirdMab
+                        ? new MorkAddressBookReader()
+                        : new SqliteAddressBookReader();
+                    var book = new AddressBook
+                    {
+                        DisplayName = cm.TargetFolderPath[^1],
+                        Path = cm.Source.Path,
+                        Format = cm.Format,
+                    };
+                    IEnumerable<ContactReadResult> results;
+                    try { results = reader.Read(book).ToList(); }
+                    catch (Exception ex) when (ex is IOException or SqliteException)
+                    {
+                        report.RecordContactWarning($"Address book skipped [{book.DisplayName}]: {ex.Message}");
+                        continue;
+                    }
+                    foreach (ContactReadResult r in results)
+                    {
+                        if (r.Success)
+                        {
+                            foreach (string w in r.Warnings) report.RecordContactWarning($"[{book.DisplayName}] {w}");
+                            planned.Add(new PlannedContact { Contact = r.Contact!, TargetFolderPath = cm.TargetFolderPath });
+                        }
+                        else
+                        {
+                            report.RecordContactSkipped(r.Source, r.Error!);
+                        }
+                    }
+                }
+
+                // Shared per-plan calendar read cache: reads each SQLite store at most once
+                // regardless of whether it is accessed by the task loop, the appointment loop,
+                // or both. Cross-platform key: normalize path; on Windows fold case.
+                var calendarReadCache = new Dictionary<string, CalendarReadResult>(
+                    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+                CalendarReadResult ReadCalendarStore(string storePath, Action<string> recordStoreWarning)
+                {
+                    string key = Path.GetFullPath(storePath);
+                    if (!calendarReadCache.TryGetValue(key, out var r))
+                    {
+                        r = new SqliteCalendarReader().Read(storePath);
+                        calendarReadCache[key] = r;
+                        // Record store-level warnings once (not per-mapping). For a store backing BOTH a task
+                        // and an appointment mapping, warnings are recorded via the first caller (task loop) —
+                        // the appointment loop skips the cache miss branch entirely. Intentional, not a bug.
+                        foreach (string warn in r.Warnings)
+                            recordStoreWarning(warn);
+                    }
+                    return r;
+                }
+
+                // Assemble tasks for this output group.
+                var plannedTasks = new List<PlannedTask>();
+                var taskFolders = new List<IReadOnlyList<string>>();
+
+                if (skipTasks && plan.TaskMappings.Count > 0 && !noTasksWarned)
+                {
+                    report.RecordTaskWarning("tasks disabled by --no-tasks");
+                    noTasksWarned = true;
+                }
+                else if (!skipTasks && plan.TaskMappings.Count > 0)
+                {
+                    foreach (TaskMapping tm in plan.TaskMappings)
+                    {
+                        taskFolders.Add(tm.TargetFolderPath);
+                        CalendarReadResult read;
+                        try { read = ReadCalendarStore(tm.Source.StorePath, w => report.RecordTaskWarning(w)); }
+                        catch (Exception ex) when (ex is IOException or SqliteException or UnauthorizedAccessException)
+                        {
+                            report.RecordTaskWarning($"Calendar store skipped [{tm.Source.StorePath}]: {ex.Message}");
+                            continue;
+                        }
+
+                        // Filter to the specified calendar (or all calendars when CalId is empty).
+                        IEnumerable<RawCalendarRead> cals = string.IsNullOrEmpty(tm.Source.CalId)
+                            ? read.Calendars
+                            : read.Calendars.Where(c => c.CalId == tm.Source.CalId);
+
+                        var taskAttResolver = new CalendarAttachmentResolver(ResolveCalendarAttachmentRoot(tm.Source, config));
+                        foreach (RawCalendarRead cal in cals)
+                        {
+                            foreach (RawTodoGroup group in cal.TodoGroups)
+                            {
+                                // Per-item containment: a single malformed todo must never abort the whole
+                                // conversion (mail/contacts/other calendars). Mirrors SqliteCalendarReader's
+                                // per-row catch — calendar data is fully untrusted.
+                                try
+                                {
+                                    TaskRecord? mapped = CalendarTaskMapper.Map(group, out IReadOnlyList<string> warns);
+                                    foreach (string w in warns)
+                                        report.RecordTaskWarning(w);
+                                    if (mapped is null)
+                                    {
+                                        // Map returned null; the first warning (if any) describes the reason.
+                                        report.RecordTaskSkipped(
+                                            tm.Source.StorePath,
+                                            warns.Count > 0 ? warns[0] : "unmappable task");
+                                    }
+                                    else
+                                    {
+                                        ApplyCalendarAttachments(mapped, group.Master?.Attachments ?? new List<RawSideText>(), taskAttResolver, report.RecordTaskWarning);
+                                        report.RecordCalendarCategories(mapped.Categories);
+                                        plannedTasks.Add(new PlannedTask
+                                        {
+                                            Task = mapped,
+                                            TargetFolderPath = tm.TargetFolderPath,
+                                        });
+                                    }
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    report.RecordTaskSkipped(tm.Source.StorePath,
+                                        $"task '{group.Master?.Id ?? "(unknown)"}' skipped: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Assemble appointments for this output group.
+                var plannedAppointments = new List<PlannedAppointment>();
+                var appointmentFolders = new List<IReadOnlyList<string>>();
+
+                if (skipAppointments && plan.AppointmentMappings.Count > 0 && !noAppointmentsWarned)
+                {
+                    report.RecordAppointmentWarning("appointments disabled by --no-appointments");
+                    noAppointmentsWarned = true;
+                }
+                else if (!skipAppointments && plan.AppointmentMappings.Count > 0)
+                {
+                    foreach (AppointmentMapping am in plan.AppointmentMappings)
+                    {
+                        appointmentFolders.Add(am.TargetFolderPath);
+                        CalendarReadResult read;
+                        try { read = ReadCalendarStore(am.Source.StorePath, w => report.RecordAppointmentWarning(w)); }
+                        catch (Exception ex) when (ex is IOException or SqliteException or UnauthorizedAccessException)
+                        {
+                            report.RecordAppointmentWarning($"Calendar store skipped [{am.Source.StorePath}]: {ex.Message}");
+                            continue;
+                        }
+
+                        // Filter to the specified calendar (or all calendars when CalId is empty).
+                        IEnumerable<RawCalendarRead> cals = string.IsNullOrEmpty(am.Source.CalId)
+                            ? read.Calendars
+                            : read.Calendars.Where(c => c.CalId == am.Source.CalId);
+
+                        var apptAttResolver = new CalendarAttachmentResolver(ResolveCalendarAttachmentRoot(am.Source, config));
+                        foreach (RawCalendarRead cal in cals)
+                        {
+                            foreach (RawEventGroup group in cal.EventGroups)
+                            {
+                                // Per-item containment: a single malformed event must never abort the whole
+                                // conversion (mail/contacts/other calendars). Mirrors SqliteCalendarReader's
+                                // per-row catch — calendar data is fully untrusted.
+                                try
+                                {
+                                    AppointmentRecord? mapped = CalendarEventMapper.Map(group, out IReadOnlyList<string> warns);
+                                    foreach (string w in warns)
+                                        report.RecordAppointmentWarning(w);
+                                    if (mapped is null)
+                                    {
+                                        // Map returned null; the first warning (if any) describes the reason.
+                                        report.RecordAppointmentSkipped(
+                                            am.Source.StorePath,
+                                            warns.Count > 0 ? warns[0] : "unmappable event");
+                                    }
+                                    else
+                                    {
+                                        ApplyCalendarAttachments(mapped, group.Master?.Attachments ?? new List<RawSideText>(), apptAttResolver, report.RecordAppointmentWarning);
+                                        report.RecordCalendarCategories(mapped.Categories);
+                                        plannedAppointments.Add(new PlannedAppointment
+                                        {
+                                            Appointment = mapped,
+                                            TargetFolderPath = am.TargetFolderPath,
+                                        });
+                                    }
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    report.RecordAppointmentSkipped(am.Source.StorePath,
+                                        $"event '{group.Master?.Id ?? "(unknown)"}' skipped: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                bundles.Add((plan, plannedMessages, planned, contactFolders, plannedTasks, taskFolders, plannedAppointments, appointmentFolders));
+            }
+
+            // Compute the baked colour FAI ONCE, from the GLOBAL union of calendar/task category
+            // names across every output group (report.CalendarCategoryNames was populated by
+            // report.RecordCalendarCategories calls throughout phase 1, above) — plus the profile's
+            // mail-tag colours (already global; read from prefs.js inside BuildXmlBytes). Baking the
+            // same union into every PST means whichever one the user makes primary carries the full
+            // category list (Outlook reads the master list from the primary store only).
+            // Bake the yellow "Star" category whenever the conversion includes mail, so a
+            // Thunderbird-starred message (surfaced as the "Star" category by the writer, not a
+            // follow-up flag) renders in colour. The FAI is stamped before mail is streamed, so we
+            // can't know here whether any message is actually starred; baking it for any mail
+            // conversion is harmless (an unused category) and guarantees starred mail renders.
+            bool hasMail = config.Outputs.Any(o => o.Sources is { Count: > 0 });
+            byte[]? faiXml = CategoryFaiPlanner.BuildXmlBytes(
+                config.ProfilePath, report.CalendarCategoryNames, includeStarCategory: hasMail);
+
+            // Phase 2: write every output group now that the global FAI is known.
+            foreach (var bundle in bundles)
+            {
+                List<string> outputFiles = _writer.WritePlan(
+                    bundle.Plan, bundle.PlannedMessages, bundle.Planned, bundle.ContactFolders,
+                    bundle.PlannedTasks, bundle.TaskFolders, bundle.PlannedAppointments, bundle.AppointmentFolders,
+                    outputDirectory, report, total, onProgress, cancellationToken, memoryObserver, faiXml);
+                report.AddOutputFiles(outputFiles);
+            }
+
+            // Post-conversion smoke test: prove every written PST opens and holds exactly the
+            // messages we counted, before this run can be reported as `done`. A failure throws
+            // InvalidDataException (not OperationCanceledException), so it is NOT caught below —
+            // it propagates out of Run to the CLI's fatal error path. Runs only here, on the
+            // fully-successful path: cancellation throws out of the loop above and never reaches
+            // this line, and the writer's own fatal aborts have already propagated.
+            PstOutputVerifier.Verify(report.OutputFiles, report.TotalWrittenItems);
+        }
+        catch (OperationCanceledException)
+        {
+            // The writer already deleted the in-progress part and recorded both the
+            // deletion and any surviving completed parts on the report.
+            report.MarkCancelled();
+        }
+        catch (SourceReadException ex)
+        {
+            ex.Report = report;
+            throw;
+        }
+
+        return report;
+    }
+
+    // …/<profile>/calendar-data/local.sqlite → <profile>. Explicit ProfilePath wins. Returns null when the
+    // store isn't under the expected calendar-data shape → local-file attachments become link-only (safe).
+    internal static string? ResolveCalendarAttachmentRoot(CalendarSourceConfig source, ConversionConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.ProfilePath)) return config.ProfilePath;
+        string? calDataDir = Path.GetDirectoryName(source.StorePath);
+        if (calDataDir is null ||
+            !string.Equals(Path.GetFileName(calDataDir), "calendar-data", StringComparison.OrdinalIgnoreCase))
+            return null;
+        return Path.GetDirectoryName(calDataDir);
+    }
+
+    // The resolve seam (unit-testable). subject used only for warning locality.
+    internal static void ApplyCalendarAttachments(
+        AppointmentRecord record, IEnumerable<RawSideText> raw,
+        CalendarAttachmentResolver resolver, Action<string> recordWarning)
+    {
+        var (atts, warns) = resolver.ResolveAll(raw, record.Subject);
+        record.Attachments = atts;
+        foreach (string w in warns) recordWarning(w);
+    }
+
+    // Overload for TaskRecord (same body; TaskRecord.Attachments / record.Subject).
+    internal static void ApplyCalendarAttachments(
+        TaskRecord record, IEnumerable<RawSideText> raw,
+        CalendarAttachmentResolver resolver, Action<string> recordWarning)
+    {
+        var (atts, warns) = resolver.ResolveAll(raw, record.Subject);
+        record.Attachments = atts;
+        foreach (string w in warns) recordWarning(w);
+    }
+
+    private static IEnumerator<ParseResult> OpenSource(IMailSourceParser parser, string sourcePath)
+    {
+        try { return parser.Parse(sourcePath).GetEnumerator(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new SourceReadException(sourcePath, ex);
+        }
+    }
+
+    private IEnumerable<PlannedMessage> EnumeratePlannedMessages(
+        PstOutputPlan plan, ConversionReport report, MsfEnrichmentOptions enrichmentOptions,
+        Action<ConversionProgressEvent>? onProgress = null)
+    {
+        foreach (SourceMapping mapping in plan.SourceMappings)
+        {
+            // Build optional .msf enrichment for this source (records attempted/degraded + any warning,
+            // emitting a live WarningEvent through onProgress on degradation).
+            SourceEnrichmentContext? enrichment =
+                SourceEnrichmentContext.TryCreate(mapping.Source, enrichmentOptions, report, onProgress);
+
+            // finally (not the natural foreach end) folds the per-message counts, so they survive early
+            // disposal of this iterator (cancellation / split-cap stop / producer fault in the writer).
+            try
+            {
+                IMailSourceParser parser = _getParser(mapping.Source.Type);
+                using IEnumerator<ParseResult> results = OpenSource(parser, mapping.Source.Path);
+
+                // 0-based per-ParseResult counter (success OR failure) so it stays aligned with
+                // the boundary engine's physical-message indices / LiveOffsetFilter.KeepIndices.
+                // Declared here so each source restarts at -1.
+                int messageIndex = -1;
+
+                while (true)
+                {
+                    ParseResult result;
+                    try
+                    {
+                        if (!results.MoveNext())
+                        {
+                            break;
+                        }
+
+                        result = results.Current;
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        throw new SourceReadException(mapping.Source.Path, ex);
+                    }
+
+                    // Advance on EVERY ParseResult (success or failure) — must come before any
+                    // continue/break so the index stays aligned with keepIndices.
+                    messageIndex++;
+
+                    if (!result.Success)
+                    {
+                        report.RecordSkipped(result.Source, result.Error!);
+                        continue;
+                    }
+
+                    foreach (string warning in result.Warnings)
+                    {
+                        report.RecordWarning(result.Source, warning);
+                        onProgress?.Invoke(new WarningEvent(result.Source.SourcePath, result.Source.Identifier, warning));
+                    }
+
+                    MailMessage message = result.Message!;
+
+                    // Drop uncompacted dead copies (live-offset filter) BEFORE enriching: dead copies
+                    // share an id with their live twin, so dropping them first leaves a clean unique-id
+                    // set for enrichment. ShouldDropOrphan is pure — increment the counter here at the
+                    // actual drop site (must-fix 1: not inside the predicate).
+                    if (enrichment?.ShouldDropOrphan(messageIndex) == true)
+                    {
+                        enrichment.Result.OrphanedCopiesDropped++;
+                        foreach (MailAttachment attachment in message.Attachments)
+                            attachment.Content.Dispose();
+                        continue;
+                    }
+
+                    bool keep = enrichment?.Apply(message) ?? true;
+                    if (!keep)
+                    {
+                        // Expunged-dropped: never yielded, so it never reaches the writer's finally
+                        // (PstWriter.WritePlan) that disposes attachment streams per dequeued message —
+                        // dispose here in the producer so the dropped message's streams don't leak.
+                        foreach (MailAttachment attachment in message.Attachments)
+                            attachment.Content.Dispose();
+                        continue;
+                    }
+
+                    // Route junk into a top-level "Junk Email" folder when JunkHandling.Folder.
+                    // Evaluated AFTER enrichment, which is what makes message.IsJunk authoritative.
+                    IReadOnlyList<string> targetPath = JunkRouting.ResolveTargetFolderPath(
+                        mapping.TargetFolderPath, message.IsJunk, enrichmentOptions.JunkHandling);
+
+                    yield return new PlannedMessage
+                    {
+                        Message = message,
+                        TargetFolderPath = targetPath,
+                    };
+                }
+            }
+            finally
+            {
+                if (enrichment is not null)
+                {
+                    report.RecordEnrichmentCounts(enrichment.Result);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,201 @@
+name: CI
+
+# CI (right-sized, advisory): build + test the engine on a windows/linux/macos matrix — the CLI engine
+# is cross-platform (net8.0); each leg also publishes the CLI single-file and smoke-runs `scan`. The
+# desktop frontend (Vitest) and desktop Rust (cargo) jobs stay windows-only — the Tauri GUI + sidecar
+# are Windows-only for now. Runs on every push and PR to master (private repo) and main (public repo).
+# See docs/repo-health-roadmap.md §3.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Avoid piling up redundant runs on rapid pushes to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test (engine, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: macos-latest
+            rid: osx-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build (Release)
+        run: dotnet build Mail2Pst.sln -c Release
+
+      - name: Test (Release)
+        run: dotnet test Mail2Pst.sln -c Release --no-build
+
+      # Prove the actual published CLI runs end-to-end on this OS, not just unit tests.
+      # Use the SAME single-file self-contained packaging shape as the desktop sidecar
+      # (PublishSingleFile + IncludeNativeLibrariesForSelfExtract, no trimming) so this also
+      # de-risks Tier 2's per-RID sidecar cross-compile. `scan` without --progress pretty-prints
+      # a multi-line JSON object, so parse the WHOLE stdout as one document. shell: pwsh
+      # (PowerShell Core) is on every GitHub runner.
+      - name: Publish-smoke scan
+        shell: pwsh
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          dotnet publish src/Mail2Pst.Cli -c Release -r $env:RID `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:PublishTrimmed=false `
+            -o publish-smoke
+          $exe = if ($env:RID -like 'win-*') { ".\publish-smoke\Mail2Pst.Cli.exe" } else { "./publish-smoke/Mail2Pst.Cli" }
+          $json = & $exe scan --input fixtures/sample.mbox
+          if ($LASTEXITCODE -ne 0) { throw "scan exited $LASTEXITCODE" }
+          $obj = $json | ConvertFrom-Json
+          if ($obj.type -ne "scan") { throw "Expected type=scan, got $($obj.type)" }
+          if ($obj.totals.messages -le 0) { throw "Expected positive totals.messages" }
+
+  desktop-test:
+    name: Test (desktop frontend)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install (npm ci)
+        working-directory: desktop
+        run: npm ci
+
+      - name: Test (Vitest)
+        working-directory: desktop
+        run: npm test
+
+  desktop-rust:
+    name: Test (desktop Rust)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install npm deps
+        working-directory: desktop
+        run: npm ci
+
+      # Publish the CLI sidecar into src-tauri/binaries/ (+ stage resources/sample.mbox).
+      # tauri-build validates that the externalBin + resources declared in tauri.conf.json
+      # exist on disk, so the sidecar must be built BEFORE cargo test or the crate won't
+      # compile. This also makes the Rust sidecar-integration tests use the real sidecar
+      # binary (locate_cli's primary path) rather than the dotnet-dll fallback.
+      - name: Build CLI sidecar
+        working-directory: desktop
+        run: npm run sidecar
+
+      # tauri-build also requires the frontendDist (../dist) to exist; build the real
+      # frontend assets so cargo test can compile the crate.
+      - name: Build frontend dist
+        working-directory: desktop
+        run: npm run build
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
+
+  # Preflight: does this push/PR touch anything that could change PST output or the validation
+  # logic? Docs-only / non-code changes skip the validate job below, so documentation and
+  # release-note PRs don't spend CI on the independent-validation build.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Path filter
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            relevant:
+              - 'src/**'
+              - 'tests/**'
+              - 'tools/pst-validate/**'
+              - 'fixtures/**'
+              - 'Mail2Pst.sln'
+              - '.github/workflows/ci.yml'
+
+  # Independent semantic validation: convert real output and re-read it with an INDEPENDENT MS-PST
+  # reader (tools/pst-validate, dev/test-only), then compare folder/message counts to the converter's
+  # own truth model. Breaks the closed-loop round-trip that shares the vendored reader. Advisory,
+  # not a required check (a paths-filtered skip must never block merges). ubuntu-only: PST output is
+  # byte-deterministic across OSes, so one leg validates all.
+  validate:
+    name: Independent PST validation (ubuntu)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the cargo registry + pst-validate target dir so the outlook-pst build is paid once.
+      - name: Cache cargo (pst-validate)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/pst-validate
+
+      # Build the INDEPENDENT MS-PST reader (dev/test-only; never shipped). --locked pins outlook-pst.
+      - name: Build pst-validate
+        run: cargo build --locked --release --manifest-path tools/pst-validate/Cargo.toml
+
+      # Run ONLY the independent-validation gate, with the validator wired in. These tests skip in
+      # the build-test matrix (env unset there); here they execute against real converter output.
+      - name: Independent-reader gate
+        env:
+          MAIL2PST_PST_VALIDATOR: ${{ github.workspace }}/tools/pst-validate/target/release/pst-validate
+        run: dotnet test tests/Mail2Pst.Integration.Tests -c Release --filter "Category=IndependentValidation"

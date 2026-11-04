@@ -1,0 +1,869 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#nullable enable
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.ExceptionServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using Mail2Pst.Core;
+using Mail2Pst.Core.Config;
+using Mail2Pst.Core.Diagnostics;
+using Mail2Pst.Core.Mapping;
+using Mail2Pst.Core.Models;
+using Mail2Pst.Core.Progress;
+using Mail2Pst.Core.Reporting;
+using PSTFileFormat;
+
+namespace Mail2Pst.Core.Writing;
+
+/// <summary>
+/// Writes planned messages into one or more PST files, built from scratch via
+/// <see cref="PSTFileFormat.PSTFile.CreateEmptyStore"/>. A single <see cref="PstOutputPlan"/>
+/// may produce multiple physical files if it exceeds <see cref="PstOutputPlan.MaxSizeBytes"/>.
+/// </summary>
+public class PstWriter
+{
+    // [M1] attachments below this never stream — the OOM is a hundreds-of-MB phenomenon (spec §1).
+    // internal (not const) so tests can lower it; production default is 16 MB.
+    internal long StreamingThresholdBytes = 16L * 1024 * 1024;
+
+    // [L4] kill-switch: env var (read once on first use) forces the byte[] path for ALL attachments.
+    private readonly bool _attachmentStreamingDisabled =
+        Environment.GetEnvironmentVariable("MAIL2PST_NO_ATTACH_STREAM") is { Length: > 0 };
+
+    // Holds the active WritePlan's cancellation token so the streaming attachment write (WriteAttachment ->
+    // SetExternalProperty(Stream)) can honor it without threading a token through the token-less write delegate.
+    // INVARIANT: set at the top of WritePlan and read only on that same WritePlan's (sequential) consumer thread.
+    // ConversionRunner runs WritePlan calls sequentially, so this is single-active. REVISIT before any
+    // multi-output / parallel WritePlan work — concurrent WritePlan calls on one PstWriter would race this field.
+    private CancellationToken _activeCancellationToken;
+
+    // built in WritePlan from the current streaming config
+    private AttachmentWriter _attachmentWriter = null!;
+
+    // Number of successfully-written messages between on-disk size checks.
+    private readonly int _checkIntervalMessages;
+
+    // Number of successfully-written messages between lightweight progress events
+    // (decoupled from the flush/size-check interval so the GUI bar moves fluidly).
+    private readonly int _progressIntervalMessages;
+
+    // Parsed-but-not-yet-written messages buffered between the parser thread
+    // and the PST-writer thread. Large enough to keep the writer busy during
+    // brief parse stalls; small enough that we don't hold many messages in
+    // memory simultaneously.
+    private const int ParseQueueCapacity = 32;
+
+    public PstWriter(int checkIntervalMessages = 500, int progressIntervalMessages = 25)
+    {
+        if (checkIntervalMessages < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(checkIntervalMessages));
+        }
+
+        if (progressIntervalMessages < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(progressIntervalMessages));
+        }
+
+        _checkIntervalMessages = checkIntervalMessages;
+        _progressIntervalMessages = progressIntervalMessages;
+    }
+
+    public List<string> WritePlan(PstOutputPlan plan, IEnumerable<PlannedMessage> messages, string outputDirectory, ConversionReport report, int totalMessages = -1, Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default, DurableMemoryObserver? memoryObserver = null)
+        => WritePlan(plan, messages, Array.Empty<PlannedContact>(), Array.Empty<IReadOnlyList<string>>(),
+                     Array.Empty<PlannedTask>(), Array.Empty<IReadOnlyList<string>>(),
+                     Array.Empty<PlannedAppointment>(), Array.Empty<IReadOnlyList<string>>(),
+                     outputDirectory, report, totalMessages, onProgress, cancellationToken, memoryObserver);
+
+    public List<string> WritePlan(PstOutputPlan plan, IEnumerable<PlannedMessage> messages,
+        IReadOnlyList<PlannedContact> contacts, IReadOnlyList<IReadOnlyList<string>> contactFolders,
+        string outputDirectory, ConversionReport report, int totalMessages = -1,
+        Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default,
+        DurableMemoryObserver? memoryObserver = null)
+        => WritePlan(plan, messages, contacts, contactFolders,
+                     Array.Empty<PlannedTask>(), Array.Empty<IReadOnlyList<string>>(),
+                     Array.Empty<PlannedAppointment>(), Array.Empty<IReadOnlyList<string>>(),
+                     outputDirectory, report, totalMessages, onProgress, cancellationToken, memoryObserver);
+
+    public List<string> WritePlan(PstOutputPlan plan, IEnumerable<PlannedMessage> messages,
+        IReadOnlyList<PlannedContact> contacts, IReadOnlyList<IReadOnlyList<string>> contactFolders,
+        IReadOnlyList<PlannedTask> tasks, IReadOnlyList<IReadOnlyList<string>> taskFolders,
+        string outputDirectory, ConversionReport report, int totalMessages = -1,
+        Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default,
+        DurableMemoryObserver? memoryObserver = null)
+        => WritePlan(plan, messages, contacts, contactFolders,
+                     tasks, taskFolders,
+                     Array.Empty<PlannedAppointment>(), Array.Empty<IReadOnlyList<string>>(),
+                     outputDirectory, report, totalMessages, onProgress, cancellationToken, memoryObserver);
+
+    public List<string> WritePlan(PstOutputPlan plan, IEnumerable<PlannedMessage> messages,
+        IReadOnlyList<PlannedContact> contacts, IReadOnlyList<IReadOnlyList<string>> contactFolders,
+        IReadOnlyList<PlannedTask> tasks, IReadOnlyList<IReadOnlyList<string>> taskFolders,
+        IReadOnlyList<PlannedAppointment> appointments, IReadOnlyList<IReadOnlyList<string>> appointmentFolders,
+        string outputDirectory, ConversionReport report, int totalMessages = -1,
+        Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default,
+        DurableMemoryObserver? memoryObserver = null, byte[]? categoryListFaiXml = null)
+    {
+        // Pre-flight: if already cancelled, create nothing so DeletedFiles stays empty.
+        cancellationToken.ThrowIfCancellationRequested();
+        _activeCancellationToken = cancellationToken;
+        _attachmentWriter = new AttachmentWriter(StreamingThresholdBytes, _attachmentStreamingDisabled);
+
+        var contactWriter = new ContactWriter();
+        var taskWriter = new TaskWriter();
+        var appointmentWriter = new AppointmentWriter();
+        var partManager = new PstPartManager(
+            plan.Name, outputDirectory, plan.MaxSizeBytes, _checkIntervalMessages,
+            writeMessage: (file, folder, message) => WriteMessageCore(file, folder, message),
+            writeContact: (file, folder, contact) => contactWriter.WriteContact(file, folder, contact),
+            writeTask: (file, folder, task) => taskWriter.WriteTask(file, folder, task),
+            writeAppointment: (file, folder, appt) => appointmentWriter.WriteAppointment(file, folder, appt),
+            categoryListFaiXml: categoryListFaiXml);
+        var throttler = new ProgressThrottler(onProgress, totalMessages);
+
+        // Producer thread parses MIME (CPU-bound); this consumer writes PST (I/O-bound).
+        // The bounded channel back-pressures the parser so it can't race far ahead.
+        using var cts = new CancellationTokenSource();
+        using var queue = new BlockingCollection<PlannedMessage>(boundedCapacity: ParseQueueCapacity);
+        Exception? producerException = null;
+
+        var producer = Task.Run(() =>
+        {
+            // Tracks the message currently being handed to the bounded queue. On cancel/fatal while the
+            // queue is full, queue.Add throws OperationCanceledException with this message NOT enqueued —
+            // so the consumer's drain loop never sees it. Dispose its (possibly temp-backed) attachments
+            // here, or that one in-flight message's temp file would leak.
+            PlannedMessage? inFlight = null;
+            try
+            {
+                foreach (PlannedMessage msg in messages)
+                {
+                    inFlight = msg;
+                    queue.Add(msg, cts.Token);
+                    inFlight = null;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (inFlight is not null)
+                    foreach (MailAttachment attachment in inFlight.Message.Attachments)
+                        attachment.Content.Dispose();
+            }
+            catch (Exception ex) { producerException = ex; }
+            finally { queue.CompleteAdding(); }
+        });
+
+        bool cancelled = false;
+        ExceptionDispatchInfo? faultCapture = null;
+        ExceptionDispatchInfo? closeFailure = null;
+        try
+        {
+            // Pre-create all folders via the typed inventory so every source type gets the
+            // correct leaf container class and an empty source still appears as an empty folder.
+            var precreate = new List<FolderToPrecreate>();
+            if (plan.IncludeEmptyFolders)
+                foreach (var m in plan.SourceMappings)
+                    precreate.Add(new FolderToPrecreate(m.TargetFolderPath, FolderItemTypeName.Note));
+            foreach (IReadOnlyList<string> contactFolder in contactFolders)
+                precreate.Add(new FolderToPrecreate(contactFolder, FolderItemTypeName.Contact));
+            foreach (IReadOnlyList<string> taskFolder in taskFolders)
+                precreate.Add(new FolderToPrecreate(taskFolder, FolderItemTypeName.Task));
+            foreach (IReadOnlyList<string> appointmentFolder in appointmentFolders)
+                precreate.Add(new FolderToPrecreate(appointmentFolder, FolderItemTypeName.Appointment));
+            partManager.Begin(precreate);
+
+            // Phase 1: mail. Phase 2: contacts — BOTH inside this try and the same open-store
+            // lifecycle, so cancel/fatal cleanup (below) covers contacts as well.
+            (string? currentSource, string? currentFolder, long estimatedOutputBytes) =
+                WriteMailPhase(queue, partManager, throttler, report, cancellationToken, memoryObserver);
+
+            // A drained queue can mean the producer failed while reading the source.
+            // Stop before other item phases or Finish can treat that truncated source as complete.
+            if (producerException is not null)
+                ExceptionDispatchInfo.Capture(producerException).Throw();
+
+            WriteContactPhase(partManager, contacts, totalMessages, estimatedOutputBytes, report, onProgress, cancellationToken);
+
+            WriteTaskPhase(partManager, tasks, totalMessages, estimatedOutputBytes, report, onProgress, cancellationToken);
+
+            WriteAppointmentPhase(partManager, appointments, totalMessages, estimatedOutputBytes, report, onProgress, cancellationToken);
+
+            partManager.Finish();
+            throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cooperative cancel: stop, let `finally` close the handle, delete in-progress part below.
+            cancelled = true;
+            cts.Cancel();
+        }
+        catch (Exception ex)
+        {
+            // Fatal write/setup failure: capture (preserving stack), stop the producer, let
+            // `finally` close the handle, delete the in-progress part below.
+            faultCapture = ExceptionDispatchInfo.Capture(ex);
+            cts.Cancel();
+        }
+        finally
+        {
+            producer.Wait();
+            try { partManager.Close(); }
+            catch (Exception ex) { closeFailure = ExceptionDispatchInfo.Capture(ex); }
+
+            // Drain any messages still queued after a fatal error and dispose their
+            // (possibly temp-backed) attachments so temp files don't linger.
+            while (queue.TryTake(out PlannedMessage? leftover))
+            {
+                foreach (MailAttachment attachment in leftover.Message.Attachments)
+                    attachment.Content.Dispose();
+            }
+        }
+
+        // Fatal path: consumer fault (faultCapture) or producer/parse fault. Handle closed,
+        // so delete only the in-progress part (CurrentPath is always the newest part), keep
+        // completed parts, rethrow the ORIGINAL exception so ConversionRunner emits `error`.
+        ExceptionDispatchInfo? fatal = faultCapture
+            ?? (producerException is not null ? ExceptionDispatchInfo.Capture(producerException) : null)
+            ?? closeFailure;
+        if (fatal is not null)
+        {
+            DiscardIncompletePart(partManager, report);
+            fatal.Throw();
+        }
+
+        if (cancelled)
+        {
+            DiscardIncompletePart(partManager, report);
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        return partManager.OutputFiles.ToList();
+    }
+
+    private static void DiscardIncompletePart(PstPartManager parts, ConversionReport report)
+    {
+        string incompletePath = parts.CurrentPath;
+        PartItemCounts discarded = parts.CurrentItems;
+        parts.DeleteCurrentPart();
+        report.DiscardWrittenItems(discarded.Mail, discarded.Contacts, discarded.Tasks, discarded.Appointments);
+        if (incompletePath.Length > 0)
+        {
+            if (!File.Exists(incompletePath)) report.RecordDeletedFile(incompletePath);
+            else report.RecordWarning(new SourceReference { SourcePath = incompletePath, Identifier = "(cleanup)" },
+                "The incomplete PST could not be removed. It is excluded from the retained results.");
+        }
+        report.AddOutputFiles(parts.OutputFiles.Where(p => !string.Equals(p, incompletePath, StringComparison.Ordinal)));
+    }
+
+    // Mail phase: the producer/consumer write loop, extracted VERBATIM from the former inline
+    // WritePlan body (only parameterized + returning its final progress state so WritePlan can
+    // emit the post-Finish progress event after the contact phase). Behaviour is byte-for-byte
+    // unchanged for mail. estimatedOutputBytes is run-wide here; NEVER reset on split.
+    private (string? currentSource, string? currentFolder, long estimatedOutputBytes) WriteMailPhase(
+        BlockingCollection<PlannedMessage> queue, PstPartManager partManager, ProgressThrottler throttler,
+        ConversionReport report, CancellationToken cancellationToken, DurableMemoryObserver? memoryObserver)
+    {
+        string? currentSource = null;
+        string? currentFolder = null;
+        long estimatedOutputBytes = 0;   // run-wide; NEVER reset on split
+        int messagesSinceProgress = 0;
+
+        foreach (PlannedMessage planned in queue.GetConsumingEnumerable())
+        {
+            currentSource = planned.Message.Source.SourcePath;
+            currentFolder = FolderPathDisplay.Join(planned.TargetFolderPath);
+
+            long messageSize = 0;
+            bool written = false;
+            try
+            {
+                // Cancellation BEFORE the predictive split so a cancelled run never
+                // creates an extra part. Inside the try so finally always disposes this
+                // dequeued message's attachments even if cancel fires before the write.
+                cancellationToken.ThrowIfCancellationRequested();
+
+                messageSize = EstimateMessageSize(planned.Message);
+
+                if (partManager.ShouldSplitBefore(messageSize))
+                    partManager.FlushAndSplit();
+
+                partManager.Write(planned.TargetFolderPath, planned.Message);
+                report.RecordConverted();
+                written = true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsRecoverableWriteError(ex))
+            {
+                report.RecordSkipped(planned.Message.Source, ex.Message);
+            }
+            finally
+            {
+                foreach (MailAttachment attachment in planned.Message.Attachments)
+                    attachment.Content.Dispose();
+            }
+
+            if (!written) continue;
+
+            estimatedOutputBytes += messageSize;
+            partManager.OnWritten(messageSize);
+            messagesSinceProgress++;
+            if (messagesSinceProgress >= _progressIntervalMessages)
+            {
+                throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
+                messagesSinceProgress = 0;
+            }
+
+            if (partManager.CheckpointDue)
+            {
+                partManager.Flush();
+                memoryObserver?.Observe(partManager.SnapshotDurableMemory(report.ConvertedCount));
+                throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
+                partManager.TrySplitOrResumeAfterFlush();   // both branches leave the part write-ready
+            }
+        }
+
+        return (currentSource, currentFolder, estimatedOutputBytes);
+    }
+
+    // Contact phase: runs after the mail phase inside the SAME open-store lifecycle, reusing the
+    // part manager's split/checkpoint machinery. Contact folders are pre-created in Begin so an
+    // empty address book still yields an IPF.Contact folder. Emits additive contact progress
+    // (Phase="contacts"); mail Converted/Total/Warnings/Skipped are preserved via the same report
+    // accessors the mail phase reads.
+    private void WriteContactPhase(PstPartManager partManager, IReadOnlyList<PlannedContact> contacts,
+        int mailTotal, long mailEstimatedOutputBytes, ConversionReport report, Action<ConversionProgressEvent>? onProgress,
+        CancellationToken cancellationToken)
+    {
+        int contactsTotal = contacts.Count;
+        foreach (PlannedContact planned in contacts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long size = EstimateContactSize(planned.Contact);
+            if (partManager.ShouldSplitBefore(size)) partManager.FlushAndSplit();
+            try
+            {
+                partManager.WriteContact(planned.TargetFolderPath, planned.Contact);
+                report.RecordContactConverted();
+            }
+            catch (ConfigValidationException) { throw; } // collision = fatal
+            partManager.OnWritten(size);
+            // Additive contact progress: mail Converted/Total stay as-is (phase="contacts").
+            onProgress?.Invoke(new ProgressEvent(
+                Converted: report.ConvertedCount,
+                TotalMessages: mailTotal,
+                Warnings: report.WarningCount,
+                Skipped: report.SkippedCount,
+                CurrentSource: planned.Contact.SourceCardId,
+                CurrentFolder: FolderPathDisplay.Join(planned.TargetFolderPath),
+                EstimatedOutputBytes: mailEstimatedOutputBytes,
+                ContactsConverted: report.ContactsConverted,
+                ContactsTotal: contactsTotal,
+                Phase: "contacts"));
+            if (partManager.CheckpointDue)
+            {
+                partManager.Flush();
+                partManager.TrySplitOrResumeAfterFlush();
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    // Task phase: runs after the contact phase inside the SAME open-store lifecycle, reusing the
+    // part manager's split/checkpoint machinery. Task folders are pre-created in Begin so an
+    // empty calendar still yields an IPF.Task folder. Emits additive task progress (Phase="tasks").
+    private void WriteTaskPhase(PstPartManager partManager, IReadOnlyList<PlannedTask> tasks,
+        int mailTotal, long mailEstimatedOutputBytes, ConversionReport report, Action<ConversionProgressEvent>? onProgress,
+        CancellationToken cancellationToken)
+    {
+        int tasksTotal = tasks.Count;
+        foreach (PlannedTask planned in tasks)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long size = EstimateTaskSize(planned.Task);
+            if (partManager.ShouldSplitBefore(size)) partManager.FlushAndSplit();
+            bool written = false;
+            try
+            {
+                partManager.WriteTask(planned.TargetFolderPath, planned.Task);
+                report.RecordTaskConverted();
+                written = true;
+            }
+            catch (ConfigValidationException) { throw; } // collision = fatal
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (IsRecoverableWriteError(ex) || ex is IOException or UnauthorizedAccessException)
+            {
+                // A single bad attachment (oversized, or a file:// source locked/deleted between resolve
+                // and write) must not abort the phase and delete the in-progress part. The item is added
+                // to the folder only AFTER its attachments are written, so a failed write committed
+                // nothing — skipping keeps the store consistent (mirrors the mail phase).
+                report.RecordTaskSkipped(planned.Task.SourceId, ex.Message);
+            }
+            if (!written) continue;
+            partManager.OnWritten(size);
+            // Additive task progress: mail Converted/Total stay as-is (phase="tasks").
+            onProgress?.Invoke(new ProgressEvent(
+                Converted: report.ConvertedCount,
+                TotalMessages: mailTotal,
+                Warnings: report.WarningCount,
+                Skipped: report.SkippedCount,
+                CurrentSource: planned.Task.SourceId,
+                CurrentFolder: FolderPathDisplay.Join(planned.TargetFolderPath),
+                EstimatedOutputBytes: mailEstimatedOutputBytes,
+                TasksConverted: report.TasksConverted,
+                TasksTotal: tasksTotal,
+                Phase: "tasks"));
+            if (partManager.CheckpointDue)
+            {
+                partManager.Flush();
+                partManager.TrySplitOrResumeAfterFlush();
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    // Appointment phase: runs after the task phase inside the SAME open-store lifecycle, reusing the
+    // part manager's split/checkpoint machinery. Appointment folders are pre-created in Begin so an
+    // empty calendar still yields an IPF.Appointment folder. Emits additive appointment progress (Phase="appointments").
+    private void WriteAppointmentPhase(PstPartManager partManager, IReadOnlyList<PlannedAppointment> appointments,
+        int mailTotal, long mailEstimatedOutputBytes, ConversionReport report, Action<ConversionProgressEvent>? onProgress,
+        CancellationToken cancellationToken)
+    {
+        int appointmentsTotal = appointments.Count;
+        foreach (PlannedAppointment planned in appointments)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long size = EstimateAppointmentSize(planned.Appointment);
+            if (partManager.ShouldSplitBefore(size)) partManager.FlushAndSplit();
+            bool written = false;
+            try
+            {
+                partManager.WriteAppointment(planned.TargetFolderPath, planned.Appointment);
+                report.RecordAppointmentConverted();
+                written = true;
+            }
+            catch (ConfigValidationException) { throw; } // collision = fatal
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (IsRecoverableWriteError(ex) || ex is IOException or UnauthorizedAccessException)
+            {
+                // A single bad attachment (oversized, or a file:// source locked/deleted between resolve
+                // and write) must not abort the phase and delete the in-progress part. The item is added
+                // to the folder only AFTER its attachments are written, so a failed write committed
+                // nothing — skipping keeps the store consistent (mirrors the mail phase).
+                report.RecordAppointmentSkipped(planned.Appointment.SourceId, ex.Message);
+            }
+            if (!written) continue;
+            partManager.OnWritten(size);
+            // Additive appointment progress: mail Converted/Total stay as-is (phase="appointments").
+            onProgress?.Invoke(new ProgressEvent(
+                Converted: report.ConvertedCount,
+                TotalMessages: mailTotal,
+                Warnings: report.WarningCount,
+                Skipped: report.SkippedCount,
+                CurrentSource: planned.Appointment.SourceId,
+                CurrentFolder: FolderPathDisplay.Join(planned.TargetFolderPath),
+                EstimatedOutputBytes: mailEstimatedOutputBytes,
+                AppointmentsConverted: report.AppointmentsConverted,
+                AppointmentsTotal: appointmentsTotal,
+                Phase: "appointments"));
+            if (partManager.CheckpointDue)
+            {
+                partManager.Flush();
+                partManager.TrySplitOrResumeAfterFlush();
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    // A contact is far smaller than a mail message; add photo bytes when present.
+    private static long EstimateContactSize(ContactRecord c) => 2048 + (c.Photo?.Bytes.Length ?? 0);
+
+    // A task is small; body is plain text (UTF-16 in PST → 2 bytes/char) + attachment bytes.
+    internal static long EstimateTaskSize(TaskRecord t) =>
+        2048 + (t.Body?.Length ?? 0) * 2 + EstimateAttachmentsSize(t.Attachments);
+
+    // An appointment: fixed overhead + plain body (UTF-16, 2 bytes/char) + HTML body (2× char count —
+    // conservative upper bound for split sizing, not UTF-8) + attachment bytes.
+    internal static long EstimateAppointmentSize(AppointmentRecord a) =>
+        2048 + (a.Body?.Length ?? 0) * 2 + (a.BodyHtml?.Length ?? 0) * 2 + EstimateAttachmentsSize(a.Attachments);
+
+    // Attachment bytes for split sizing: inline decoded bytes, or the local-file length for ByValue
+    // (LinkOnly carries no PST attachment row — its reference lives in the body, already counted).
+    // A local file that cannot be stat'd contributes only per-attachment overhead (estimate only).
+    private static long EstimateAttachmentsSize(IReadOnlyList<CalendarAttachment> atts)
+    {
+        long size = 0;
+        foreach (CalendarAttachment att in atts)
+        {
+            switch (att.Kind)
+            {
+                case CalendarAttachmentKind.InlineBytes:
+                    size += (att.InlineData?.Length ?? 0) + PerAttachmentOverheadBytes;
+                    break;
+                case CalendarAttachmentKind.LocalFileByValue:
+                    long len = 0;
+                    try { if (att.LocalPath is not null) len = new FileInfo(att.LocalPath).Length; }
+                    catch { /* estimate only — an unreadable file contributes overhead only */ }
+                    size += len + PerAttachmentOverheadBytes;
+                    break;
+                // LinkOnly → no PST attachment row.
+            }
+        }
+        return size;
+    }
+
+    private static string GetPlainTextBody(MailMessage message)
+    {
+        if (!string.IsNullOrEmpty(message.TextBody))
+        {
+            return message.TextBody;
+        }
+
+        if (!string.IsNullOrEmpty(message.HtmlBody))
+        {
+            return HtmlToPlainText(message.HtmlBody);
+        }
+
+        return string.Empty;
+    }
+
+    private static readonly string[] ThreadingPrefixes = { "Re:", "Fwd:", "FW:", "AW:", "SV:", "TR:" };
+
+    // 255 chars is the MAPI subject cap, and the vendored Subject setter prepends the 2-char
+    // MS-PST subject-prefix marker — so the value itself may carry at most 253 chars.
+    private const int MaxSubjectLength = 253;
+
+    /// <summary>
+    /// Sanitizes a source subject for PST storage (see SubjectSanitizationTests):
+    ///  - strips C0 control characters (0x00–0x1F) and DEL — a leading 0x01 collides with the
+    ///    MS-PST subject-prefix encoding, so raw control bytes from a mangled source header make
+    ///    scanpst reject the folder's contents-table row ("row doesn't match sub-object");
+    ///  - truncates to the 255-char MAPI cap (incl. the 2-char prefix) — Outlook does the same,
+    ///    and an overlong subject spills the contents-table row cell past the heap allocation
+    ///    limit into a subnode, which scanpst also rejects as a row mismatch.
+    /// </summary>
+    private static string SanitizeSubject(string? subject)
+    {
+        string text = subject ?? string.Empty;
+        if (text.Length == 0) return text;
+        int keep = 0;
+        Span<char> buffer = text.Length <= 512 ? stackalloc char[text.Length] : new char[text.Length];
+        foreach (char c in text)
+        {
+            if (c >= 0x20 && c != 0x7F)
+            {
+                buffer[keep++] = c;
+                if (keep == MaxSubjectLength) break;
+            }
+        }
+        return keep == text.Length ? text : new string(buffer[..keep]);
+    }
+
+    private static string StripThreadingPrefixes(string? subject)
+    {
+        if (string.IsNullOrEmpty(subject)) return string.Empty;
+        string current = subject.Trim();
+        bool stripped;
+        do
+        {
+            stripped = false;
+            foreach (string prefix in ThreadingPrefixes)
+            {
+                if (current.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    current = current.Substring(prefix.Length).Trim();
+                    stripped = true;
+                    break;
+                }
+            }
+        } while (stripped);
+        return current;
+    }
+
+    // Lightweight HTML-to-text fallback for clients that don't render PidTagHtml; not a full HTML parser.
+    // internal (not private) so it can be unit-tested directly; visible to the test assembly via
+    // InternalsVisibleTo("Mail2Pst.Core.Tests"). Guarded against regex ReDoS: see HtmlRegexTimeout /
+    // HtmlScriptStyleStripMaxChars. Degraded plain text is acceptable; this method must never throw
+    // from the guard path.
+    internal static string HtmlToPlainText(string html)
+    {
+        // Script/style removal is the backtracking vector. Skip it above the size cap;
+        // otherwise run it under a timeout and fall back to the un-stripped html on timeout.
+        string withoutScriptsAndStyles = html;
+        if (html.Length <= HtmlScriptStyleStripMaxChars)
+        {
+            try
+            {
+                withoutScriptsAndStyles = ScriptStyleRegex.Replace(html, " ");
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                withoutScriptsAndStyles = html;
+            }
+        }
+
+        string withoutTags;
+        try
+        {
+            withoutTags = HtmlTagRegex.Replace(withoutScriptsAndStyles, " ");
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            withoutTags = withoutScriptsAndStyles;
+        }
+
+        string decoded = WebUtility.HtmlDecode(withoutTags);
+        return Regex.Replace(decoded, @"[ \t]+", " ").Trim();
+    }
+
+    // HtmlToPlainText ReDoS guard. The script/style removal uses a lazy match that
+    // can backtrack badly on pathological HTML (e.g. an unclosed <script>). Bound it
+    // with a regex timeout and skip it entirely above a size cap; the <[^>]*> tag
+    // strip is linear but carries a timeout defensively.
+    private const int HtmlScriptStyleStripMaxChars = 1_000_000;
+    private static readonly TimeSpan HtmlRegexTimeout = TimeSpan.FromSeconds(2);
+
+    private static readonly Regex ScriptStyleRegex = new(
+        @"<(script|style)\b[^>]*>.*?</\1>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant,
+        HtmlRegexTimeout);
+
+    private static readonly Regex HtmlTagRegex = new(
+        @"<[^>]*>",
+        RegexOptions.CultureInvariant,
+        HtmlRegexTimeout);
+
+    // Per-message PST structural overhead not captured by the content byte counts below:
+    // node B-tree entry (~128 B) + property-context heap for ~20 properties (~512 B) +
+    // recipient table for 1-2 recipients (~256 B) + the fixed string properties WriteMessage
+    // always sets — sender, PidTagInternetMessageId, In-Reply-To/References, conversation
+    // topic ×2 (~512 B) + attachment subnode pointer table (~256 B) + block alignment/padding
+    // (~384 B) ≈ 2048 B. An order-of-magnitude estimate, NOT a measurement — the on-disk
+    // checkpoint in WritePlan is the authoritative backstop, so this only has to be roughly right.
+    private const long PerMessageOverheadBytes = 2048;
+
+    // Per-attachment overhead beyond the raw content bytes: the attachment subnode plus its
+    // 8-12 metadata properties (long/short filename, display name, extension, MIME tag, method,
+    // size, optional content-id/location/flags/hidden). Dwarfed by real attachment content for
+    // typical messages; the backstop covers the rare many-tiny-inline-attachments case where
+    // this flat constant under-counts the aggregate.
+    private const long PerAttachmentOverheadBytes = 512;
+
+    // MAPI bit flags for PidTagMessageFlags (MS-OXCMSG). Named here so the bit math
+    // at the write sites reads intentionally instead of as raw hex.
+    private const int MSGFLAG_READ = 0x0001;
+    private const int MSGFLAG_HASATTACH = 0x0010;
+
+    internal static long EstimateMessageSize(MailMessage message)
+    {
+        // PidTagSubject is stored as Unicode (UTF-16) → 2 bytes/char.
+        long size = 2L * (message.Subject?.Length ?? 0);
+
+        // PidTagBody = GetPlainTextBody(message): TextBody verbatim if present, else the HTML→text
+        // fallback (HtmlToPlainText output is always <= HtmlBody.Length). Estimate its char count
+        // WITHOUT running the regex converter a second time (WriteMessage already runs it):
+        // TextBody.Length when present, otherwise HtmlBody.Length as a cheap UPPER-BOUND proxy —
+        // a deliberate slight over-count, safe for a cap estimate (splits early, not late).
+        // PidTagBody is Unicode → 2 bytes/char.
+        int plainTextChars = !string.IsNullOrEmpty(message.TextBody)
+            ? message.TextBody!.Length
+            : (message.HtmlBody?.Length ?? 0);
+        size += 2L * plainTextChars;
+
+        // PidTagHtml is written as UTF-8 BYTES in WriteMessage, not UTF-16 code units.
+        if (!string.IsNullOrEmpty(message.HtmlBody))
+            size += Encoding.UTF8.GetByteCount(message.HtmlBody);
+
+        foreach (MailAttachment attachment in message.Attachments)
+            size += attachment.Content.Length + PerAttachmentOverheadBytes;
+
+        return size + PerMessageOverheadBytes;
+    }
+
+    // Per-message write, extracted as an overridable seam so tests can inject a
+    // deterministic write failure without contriving exotic message data. Production
+    // behavior is unchanged — it simply calls WriteMessage. internal: visible to the
+    // test assembly via InternalsVisibleTo("Mail2Pst.Core.Tests").
+    internal virtual void WriteMessageCore(PSTFile file, PSTFolder folder, MailMessage message)
+        => WriteMessage(file, folder, message);
+
+    // A PST writer failure is fatal unless PROVEN to be one bad message. By the time we
+    // write, the message has parsed successfully, so a write failure is almost certainly
+    // a bug, a vendored PST-library failure, invalid internal state, or a filesystem/temp
+    // problem — all of which must surface as fatal (mirroring the parse-side taxonomy in
+    // MboxParser). The allowlist is kept DELIBERATELY MINIMAL: add a specific exception type
+    // ONLY after a real data-driven write failure is observed and proven safely skippable.
+    // Its one member is AttachmentTooLargeException — a property of one bad message, detected
+    // up front before any node is written, so that message is recorded as a skip and the rest
+    // of the conversion proceeds. Everything else stays fatal.
+    internal static bool IsRecoverableWriteError(Exception ex) => ex is AttachmentTooLargeException;
+
+    // PidTagAttachSize is a PT_LONG (signed 32-bit), so an attachment can store at most
+    // int.MaxValue content bytes; larger content cannot be represented and would also force
+    // a >2 GB single allocation in AttachmentContent.ReadAllBytes.
+    internal const long MaxAttachmentBytes = int.MaxValue;
+
+    internal static bool AttachmentTooLarge(long contentLength) => contentLength > MaxAttachmentBytes;
+
+    private void WriteMessage(PSTFile file, PSTFolder folder, MailMessage message)
+    {
+        // Pre-flight: reject a message carrying an unrepresentable attachment BEFORE creating
+        // any node, so an oversized attachment becomes a clean per-message skip rather than a
+        // wrapped PidTagAttachSize cast, a >2 GB ReadAllBytes allocation, or an orphan note.
+        foreach (MailAttachment preflight in message.Attachments)
+        {
+            if (AttachmentTooLarge(preflight.Content.Length))
+                throw new AttachmentTooLargeException(preflight.FileName, preflight.Content.Length);
+        }
+
+        Note note = Note.CreateNewNote(file, folder.NodeID);
+        string sanitizedSubject = SanitizeSubject(message.Subject);
+        note.Subject = sanitizedSubject;
+
+        if (message.From is not null)
+        {
+            // A malformed/empty From header (e.g. "From: <>") can yield an empty email.
+            // Only claim an SMTP sender address when we actually have one — otherwise we'd
+            // write an "SMTP" address type with an empty address, which Outlook renders oddly.
+            string email = message.From.Email;
+            bool hasEmail = !string.IsNullOrWhiteSpace(email);
+            string senderName = message.From.Name ?? (hasEmail ? email : string.Empty);
+            note.SenderName = senderName;
+            note.SentRepresentingName = senderName;
+            if (hasEmail)
+            {
+                note.SenderAddressType = "SMTP";
+                note.SenderEmailAddress = email;
+                note.SentRepresentingAddressType = "SMTP";
+                note.SentRepresentingEmailAddress = email;
+            }
+        }
+
+        note.Body = GetPlainTextBody(message);
+
+        if (!string.IsNullOrEmpty(message.HtmlBody))
+        {
+            note.PC.SetBytesProperty(PropertyID.PidTagHtml, Encoding.UTF8.GetBytes(message.HtmlBody));
+            note.PC.SetInt32Property(PropertyID.PidTagNativeBody, 3);
+            note.InternetCodepage = 65001;
+        }
+
+        if (message.Date.HasValue)
+        {
+            DateTime utcDate = ClampToFileTimeRange(message.Date.Value.UtcDateTime);
+            note.ClientSubmitTime = utcDate;
+            note.MessageDeliveryTime = utcDate;
+        }
+
+        static IEnumerable<MessageRecipient> ToRecipients(IEnumerable<MailAddress> addresses, RecipientType type) =>
+            addresses.Select(address =>
+                new MessageRecipient(address.Name ?? address.Email, address.Email, isOrganizer: false, type));
+
+        List<MessageRecipient> recipients = ToRecipients(message.To, RecipientType.To)
+            .Concat(ToRecipients(message.Cc, RecipientType.Cc))
+            .Concat(ToRecipients(message.Bcc, RecipientType.Bcc))
+            .ToList();
+
+        if (recipients.Count > 0)
+        {
+            note.AddRecipients(recipients);
+        }
+
+        if (message.MessageId is not null)
+            note.PC.SetStringProperty(PropertyID.PidTagInternetMessageId, message.MessageId);
+        if (message.InReplyTo is not null)
+            note.PC.SetStringProperty((PropertyID)0x1042, message.InReplyTo);
+        if (message.References is not null)
+            note.PC.SetStringProperty((PropertyID)0x1039, message.References);
+
+        note.PC.SetInt32Property(PropertyID.PidTagImportance, (int)message.Importance);
+        note.PC.SetInt32Property(PropertyID.PidTagPriority, (int)message.Importance - 1);
+
+        string normalizedSubject = StripThreadingPrefixes(sanitizedSubject);
+        note.PC.SetStringProperty(PropertyID.PidTagConversationTopic, normalizedSubject);
+        note.PC.SetStringProperty((PropertyID)0x0E1D, normalizedSubject);
+
+        foreach (MailAttachment attachment in message.Attachments)
+        {
+            WriteAttachment(file, note, attachment);
+        }
+
+        // Set message flags AFTER attachments are written: the vendored
+        // AddAttachment unconditionally sets MSGFLAG_HASATTACH for any attachment
+        // (including inline ones), so we must have the final word here. We only
+        // control the two bits we own (MSGFLAG_READ, MSGFLAG_HASATTACH) and
+        // preserve everything else Note.CreateNewNote/AddAttachment set.
+        int messageFlags = note.PC.GetInt32Property(PropertyID.PidTagMessageFlags) ?? 0;
+        if (message.IsRead) messageFlags |= MSGFLAG_READ;
+        else messageFlags &= ~MSGFLAG_READ;
+        // Set MSGFLAG_HASATTACH whenever the message carries ANY attachment object — inline
+        // included. scanpst validates the contents-table row against this rule ("Message flags
+        // missing MSGFLAG_HASATTACH" → RepairRequired for every inline-only message otherwise).
+        // The paperclip is suppressed the way Outlook itself does it: PidTagAttachmentHidden on
+        // each inline (CID) part, which WriteAttachment already sets. (Policy changed 2026-07-07,
+        // owner-approved, from flag-cleared-for-inline-only; see PstWriterMetadataTests.)
+        if (message.Attachments.Count > 0) messageFlags |= MSGFLAG_HASATTACH;
+        else messageFlags &= ~MSGFLAG_HASATTACH;
+        note.PC.SetInt32Property(PropertyID.PidTagMessageFlags, messageFlags);
+
+        // Last verb (replied/forwarded). PidTagLastVerbExecuted is single-valued: when both are
+        // set we prefer reply (102) — replied is the more user-visible action (documented limitation).
+        int? lastVerb = message.IsReplied ? 102 : (message.IsForwarded ? 104 : (int?)null);
+        if (lastVerb is { } verb)
+        {
+            note.PC.SetInt32Property(PropertyID.PidTagLastVerbExecuted, verb);
+            note.PC.SetDateTimeProperty(PropertyID.PidTagLastVerbExecutionTime, LastVerbTime(message));
+        }
+
+        // Categories = the message's Thunderbird tags, plus a synthetic "Star" category for a
+        // Thunderbird-"Marked"/starred message. A star is surfaced as a (yellow) category — NOT an
+        // Outlook follow-up flag, which would place every starred message into Outlook's To-Do list.
+        List<string> categories = MailCategoryComposer.Compose(message.Categories, message.IsFlagged);
+        if (categories.Count > 0)
+        {
+            ushort keywordsId = PSTFileFormat.PropertyNameToIDMap.GetOrCreateStringNamedProperty(file, 2, "Keywords");
+            note.PC.SetMultiStringProperty((PSTFileFormat.PropertyID)keywordsId, categories);
+        }
+
+        note.SaveChanges();
+        folder.AddMessage(note);
+        // folder.SaveChanges() is intentionally NOT called per message: PstPartManager batches it
+        // (SaveDirtyFolders) to each checkpoint/split/finish flush, before EndSavingChanges. Saving
+        // a folder's whole contents table per message is ~O(n^2); batching is the E3 perf win.
+    }
+
+    private void WriteAttachment(PSTFile file, Note note, MailAttachment a)
+    {
+        _attachmentWriter.Write(file, note, new AttachmentSpec(
+            a.FileName, a.MimeType, a.Content,
+            ContentId: a.ContentId, ContentLocation: a.ContentLocation,
+            IsInline: a.IsInline), _activeCancellationToken);
+    }
+
+    // Windows FILETIME epoch is 1601-01-01. DateTime.ToFileTimeUtc() throws
+    // ArgumentOutOfRangeException for dates before that, which would skip the
+    // whole message. Clamp to the valid range instead.
+    private static readonly DateTime MinFileTime = new DateTime(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    private static DateTime ClampToFileTimeRange(DateTime utcDate) =>
+        utcDate < MinFileTime ? MinFileTime : utcDate;
+
+    // The verb timestamp is metadata, not content: when the message has no date, "now" is a better
+    // fallback than omitting it (Outlook may not render the reply/forward arrow without a time).
+    private static DateTime LastVerbTime(MailMessage message)
+    {
+        DateTime utcDate = message.Date?.UtcDateTime ?? DateTime.UtcNow;
+        return ClampToFileTimeRange(utcDate);
+    }
+}

@@ -1,0 +1,55 @@
+MBOXPORT 1.0.1 - VALIDAZIONE DEL 4 NOVEMBRE 2026
+
+Ambiente: Windows x64, .NET SDK 8.0.427, runtime pubblicato 8.0.33.
+
+PROVE AUTOMATICHE
+- 32 test applicativi superati: conversione, origine invariata, isolamento
+  delle sessioni, annullamento in analisi/scrittura, conteggi dei PST
+  conservati dopo una suddivisione, diagnostica non scrivibile, validazione
+  degli ingressi, cataloghi delle 10 lingue, placeholder, formati numerici,
+  culture, preferenze e conversione con rapporto in inglese/arabo.
+- 63 test selezionati del motore superati dalla procedura build.ps1,
+  compresi i nuovi casi su lettura incompleta e rollback dei contatori.
+- Suite Core completa: 1.304 test superati, 1 ignorato intenzionalmente
+  (generatore manuale di un PST per il collaudo Outlook).
+  I 63 test selezionati sono inclusi nella suite completa.
+- SmokeTest: 240/240 messaggi MIME sintetici convertiti, 10 parti PST,
+  nessun messaggio saltato e nessun avviso di conversione.
+- I test di lettura incompleta simulano IOException/UnauthorizedAccessException
+  dopo messaggi validi e verificano errore, cleanup e parti conservate.
+- I test di annullamento rileggono i PST rimasti e confrontano i messaggi
+  presenti con i conteggi del rapporto; la parte eliminata e' separata.
+
+COMPILAZIONE E PACCHETTI
+- Procedura PowerShell verificata anche con Windows PowerShell 5.1.
+- Restore bloccati per app, test e SmokeTest con win-x64.
+- Sorgenti estratti in una cartella pulita e ricompilati.
+- ZIP sorgenti senza bin, obj, artifacts, .git o file generati della build.
+- Portatile autonomo, sorgenti corrispondenti e licenze inclusi.
+- Hash SHA-256 dei pacchetti in SHA256SUMS.txt.
+- Inno Setup non presente nell'ambiente: non prodotto un nuovo installer.
+
+LOCALIZZAZIONE E INTERFACCIA
+- 10 cataloghi incorporati, 98 chiavi ciascuno: en, it, zh-Hans, hi, es,
+  ar, fr, bn, pt, id. Chiavi e placeholder controllati automaticamente.
+- Interfaccia aperta e ispezionata in italiano, arabo, hindi e bengalese.
+- Verificati cambio lingua, persistenza, disposizione RTL araba e
+  leggibilita' del percorso di destinazione dopo la correzione del campo.
+- La scelta del file apre il dialogo nativo; la conversione completa e'
+  stata verificata automaticamente, non con una sequenza UI completa.
+- Le traduzioni non sono state oggetto di una revisione linguistica umana.
+- I dettagli grezzi del motore e del sistema operativo possono rimanere
+  nella lingua originale; l'interfaccia li identifica come diagnostica.
+
+LIMITI DEL COLLAUDO
+- Non verificata l'apertura dei PST con Microsoft Outlook.
+- Non completata una conversione reale oltre 20 GiB.
+- Non collaudate tutte le varianti di esportazione dei fornitori.
+- Non rieseguita in questa release la rilettura indipendente Python con
+  pypstreader. Lo script opzionale e' incluso nei sorgenti.
+- Restano avvisi del compilatore nelle parti upstream; nessun errore
+  applicativo nei controlli completati.
+- La versione 1.0.1 non aggiunge ripresa automatica, importazione in coda
+  o decodifica MIME a memoria limitata per allegati molto grandi.
+
+Per ripetere la procedura: README.md, README.it.md e build.ps1.

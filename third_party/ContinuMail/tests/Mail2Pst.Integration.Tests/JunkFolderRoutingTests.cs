@@ -1,0 +1,123 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Mail2Pst.Core;
+using Mail2Pst.Core.Config;
+using Mail2Pst.Core.Reporting;
+using Xunit;
+
+namespace Mail2Pst.Integration.Tests;
+
+public class JunkFolderRoutingTests
+{
+    // .msf: message-id=a@h, flags=5 (read+marked), junkscore=90 (junk), keywords=work.
+    private const string MsfText =
+        "< <(a=c)> (80=ns:msg:db:row:scope:msgs:all)(96=ns:msg:db:table:kind:msgs)" +
+        "(88=flags)(89=message-id)(8A=junkscore)(8B=keywords) >\n" +
+        "{1:^80 {(k^96:c)} [1(^88=5)(^89=a@h)(^8A=90)(^8B=work)] }";
+
+    private static string Msg(string id, string body) =>
+        $"From s@e Thu Jan 01 00:00:00 2026\nMessage-ID: {id}\nSubject: t\n\n{body}\n";
+
+    private static string WriteTemp(string content, string ext)
+    {
+        string p = Path.Combine(Path.GetTempPath(), "mail2pst-jfr-" + Guid.NewGuid() + ext);
+        File.WriteAllText(p, content);
+        return p;
+    }
+
+    private static string NewOutDir()
+    {
+        string d = Path.Combine(Path.GetTempPath(), "mail2pst-jfro-" + Guid.NewGuid());
+        Directory.CreateDirectory(d);
+        return d;
+    }
+
+    private static (IReadOnlyList<ReadFolder> folders, ConversionReport report) Convert(
+        string mboxPath, string? msfPath, string outDir, JunkHandlingMode junk)
+    {
+        var config = new ConversionConfig
+        {
+            JunkHandling = junk,
+            Outputs =
+            {
+                new OutputGroupConfig
+                {
+                    Name = "Out",
+                    Sources = { new SourceConfig
+                        { Path = mboxPath, Type = "mbox", MsfPath = msfPath, TargetFolder = "Inbox" } },
+                },
+            },
+        };
+        var runner = new ConversionRunner();
+        ConversionReport report = runner.Run(config, outDir);
+        return (PstReader.Read(report.OutputFiles), report);
+    }
+
+    [Fact]
+    public void FolderMode_RoutesJunkToJunkEmail_PreservesTags_NonJunkStays()
+    {
+        // <a@h> = junk (junkscore 90) + keyword "work"; <b@h> = no .msf row -> not junk.
+        string mbox = WriteTemp(Msg("<a@h>", "one") + Msg("<b@h>", "two"), ".mbox");
+        string msf = WriteTemp(MsfText, ".msf");
+        string outDir = NewOutDir();
+        try
+        {
+            var (folders, _) = Convert(mbox, msf, outDir, JunkHandlingMode.Folder);
+
+            ReadFolder junk = folders.Single(f => f.DisplayPath == "Junk Email");
+            ReadFolder inbox = folders.Single(f => f.DisplayPath == "Inbox");
+
+            ReadBackMessage routed = Assert.Single(junk.Messages);
+            Assert.Equal("<a@h>", routed.MessageId);
+            Assert.True(routed.IsRead);                        // .msf flags=5 applied -> enrich ran BEFORE routing
+            Assert.True(routed.IsFlagged);
+            Assert.Contains("work", routed.Categories);       // user tag preserved
+            Assert.DoesNotContain("Junk", routed.Categories); // synthetic category suppressed in Folder mode
+
+            ReadBackMessage stayed = Assert.Single(inbox.Messages);
+            Assert.Equal("<b@h>", stayed.MessageId);
+        }
+        finally { File.Delete(mbox); File.Delete(msf); Directory.Delete(outDir, true); }
+    }
+
+    [Fact]
+    public void FolderMode_MsfDegrades_NoRouting_NoJunkCategory_StillWarns()
+    {
+        // .msf present but unreadable -> enrichment degrades -> IsJunk never set -> behaves like Off.
+        string mbox = WriteTemp(Msg("<a@h>", "one"), ".mbox");
+        string outDir = NewOutDir();
+        try
+        {
+            var (folders, report) = Convert(mbox, "no-such.msf", outDir, JunkHandlingMode.Folder);
+
+            Assert.DoesNotContain(folders, f => f.DisplayPath == "Junk Email");
+            ReadFolder inbox = folders.Single(f => f.DisplayPath == "Inbox");
+            ReadBackMessage m = Assert.Single(inbox.Messages);
+            Assert.Equal("<a@h>", m.MessageId);
+            Assert.DoesNotContain("Junk", m.Categories);
+            Assert.Equal(1, report.EnrichmentSummary.SourcesDegraded);
+            Assert.Equal(1, report.WarningCount);
+        }
+        finally { File.Delete(mbox); Directory.Delete(outDir, true); }
+    }
+
+    [Fact]
+    public void FolderMode_NoJunk_DoesNotPreCreateJunkEmail()
+    {
+        // No .msf -> nothing is junk. IncludeEmptyFolders defaults true (pre-creates mapped folders only).
+        string mbox = WriteTemp(Msg("<a@h>", "one"), ".mbox");
+        string outDir = NewOutDir();
+        try
+        {
+            var (folders, _) = Convert(mbox, null, outDir, JunkHandlingMode.Folder);
+
+            Assert.Contains(folders, f => f.DisplayPath == "Inbox");            // mapped folder present
+            Assert.DoesNotContain(folders, f => f.DisplayPath == "Junk Email"); // never pre-created
+        }
+        finally { File.Delete(mbox); Directory.Delete(outDir, true); }
+    }
+}

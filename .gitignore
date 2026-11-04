@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/node_modules/
+artifacts/
+**/.vs/
+*.user
+*.suo
+*.pst
+*.ost
+.env
+.env.*
+*.pfx

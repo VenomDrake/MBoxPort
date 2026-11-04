@@ -1,0 +1,74 @@
+import { describe, it, expect } from "vitest";
+import { groupByAccount, sanitizePstName, dedupePstNames } from "./accounts";
+import type { Account, ProfileSourceRow } from "./types";
+
+const acct = (id: string, email: string | null, seg: string): Account =>
+  ({ id, folderSegment: seg, accountPath: id, store: "ImapMail",
+     email, host: seg, addressResolution: email ? "identity" : "not-found" });
+const row = (id: string, accountId: string | null, tfp: string[], msgs: number, bytes: number): ProfileSourceRow =>
+  ({ id, path: id, accountId, targetFolderPath: tfp, displayName: tfp.join(" / "),
+     messages: msgs, bytes, sourceBytes: bytes * 2, msfPath: null } as any);
+
+describe("groupByAccount", () => {
+  it("groups rows by accountId and aggregates estimated bytes", () => {
+    const groups = groupByAccount(
+      [row("a", "A", ["imap.example.com", "Inbox"], 10, 100),
+       row("b", "A", ["imap.example.com", "Sent"], 5, 50),
+       row("c", "B", ["Office365", "Inbox"], 3, 30)],
+      [acct("A", "alice@example.com", "imap.example.com"), acct("B", "alice@example.test", "Office365")]);
+    expect(groups).toHaveLength(2);
+    const a = groups.find((g) => g.key === "A")!;
+    expect(a.folderCount).toBe(2);
+    expect(a.messageCount).toBe(15);
+    expect(a.estimatedBytes).toBe(150);          // sum of `bytes`, NOT sourceBytes
+    expect(a.defaultPstName).toBe("alice@example.com");
+  });
+
+  it("defaults PST name to folderSegment when no email", () => {
+    const groups = groupByAccount([row("a", "A", ["Local Folders", "Notes"], 1, 1)],
+      [acct("A", null, "Local Folders")]);
+    expect(groups[0].defaultPstName).toBe("Local Folders");
+  });
+
+  it("falls back to targetFolderPath[0] when accountId is null", () => {
+    const groups = groupByAccount([row("a", null, ["imap.example.com", "Inbox"], 1, 1)], []);
+    expect(groups[0].key).toBe("imap.example.com");
+  });
+});
+
+describe("sanitizePstName", () => {
+  it("strips illegal filename + control chars, keeps @ and .", () => {
+    expect(sanitizePstName('a/b:c*?"<>|@x.com')).toBe("abc@x.com");
+  });
+  it("trims whitespace and leading/trailing periods", () => {
+    expect(sanitizePstName("  ...Mail...  ")).toBe("Mail");
+  });
+  it("falls back to 'Account' when empty after sanitizing", () => {
+    expect(sanitizePstName("...")).toBe("Account");
+  });
+  it("escapes reserved Windows device names, including with an extension", () => {
+    // Prefix (not suffix) so no "<reserved>.<ext>" form survives the backend regex.
+    expect(sanitizePstName("CON")).toBe("mail-CON");
+    expect(sanitizePstName("LPT1.backup")).toBe("mail-LPT1.backup");
+    expect(sanitizePstName("AUX.2024")).toBe("mail-AUX.2024");   // stem+ext — the backend-abort bug
+    expect(sanitizePstName("con.backup")).toBe("mail-con.backup");
+    expect(sanitizePstName("com1.log")).toBe("mail-com1.log");
+    // A normal name that merely contains a reserved substring is untouched.
+    expect(sanitizePstName("Console")).toBe("Console");
+  });
+});
+
+describe("dedupePstNames", () => {
+  it("leaves distinct names unchanged", () => {
+    expect(dedupePstNames(["A", "B"])).toEqual(["A", "B"]);
+  });
+  it("suffixes a collision with -2", () => {
+    expect(dedupePstNames(["Same", "Same"])).toEqual(["Same", "Same-2"]);
+  });
+  it("is case-insensitive", () => {
+    expect(dedupePstNames(["mail", "MAIL"])).toEqual(["mail", "MAIL-2"]);
+  });
+  it("skips an already-taken suffix", () => {
+    expect(dedupePstNames(["a", "a-2", "a"])).toEqual(["a", "a-2", "a-3"]);
+  });
+});

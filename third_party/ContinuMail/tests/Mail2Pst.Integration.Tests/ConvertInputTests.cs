@@ -1,0 +1,167 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+using System;
+using System.IO;
+using Mail2Pst.Cli;
+using Mail2Pst.Core.Config;
+using Xunit;
+
+namespace Mail2Pst.Integration.Tests;
+
+public class ConvertInputTests
+{
+    // Builds a minimal Thunderbird profile dir: <p>/Mail/Local Folders/{Inbox, Inbox.msf}.
+    private static string MakeProfile()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "mail2pst-prof-" + Guid.NewGuid());
+        string acct = Path.Combine(root, "Mail", "Local Folders");
+        Directory.CreateDirectory(acct);
+        File.WriteAllText(Path.Combine(acct, "Inbox"), "");            // 0-byte = valid empty folder
+        File.WriteAllText(Path.Combine(acct, "Inbox.msf"), "x");       // existence-only pairing
+        return root;
+    }
+
+    [Fact]
+    public void Resolve_MissingOutput_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--config", "c.json" });
+        Assert.NotNull(r.Error);
+        Assert.Null(r.Config);
+    }
+
+    [Fact]
+    public void Resolve_NeitherConfigNorProfile_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--output", "out" });
+        Assert.NotNull(r.Error);
+    }
+
+    [Fact]
+    public void Resolve_ProfileOnly_BuildsConfigWithDiscoveredSources()
+    {
+        string profile = MakeProfile();
+        try
+        {
+            ConvertResolution r = ConvertInput.Resolve(new[] { "--profile", profile, "--output", "out" });
+            Assert.Null(r.Error);
+            Assert.NotNull(r.Config);
+            OutputGroupConfig g = Assert.Single(r.Config!.Outputs);
+            SourceConfig s = Assert.Single(g.Sources);
+            Assert.NotNull(s.MsfPath);
+            Assert.EndsWith("Inbox.msf", s.MsfPath);
+            Assert.Equal(profile, r.InputLabel);
+        }
+        finally { Directory.Delete(profile, true); }
+    }
+
+    [Fact]
+    public void Resolve_ProfileWithMultiGroupTemplate_Error()
+    {
+        string profile = MakeProfile();
+        string cfg = Path.Combine(Path.GetTempPath(), "mail2pst-tmpl-" + Guid.NewGuid() + ".json");
+        File.WriteAllText(cfg, "{\"outputs\":[{\"name\":\"A\",\"sources\":[]},{\"name\":\"B\",\"sources\":[]}]}");
+        try
+        {
+            ConvertResolution r = ConvertInput.Resolve(new[] { "--profile", profile, "--config", cfg, "--output", "out" });
+            Assert.NotNull(r.Error);
+            Assert.Null(r.Config);
+        }
+        finally { Directory.Delete(profile, true); File.Delete(cfg); }
+    }
+
+    [Fact]
+    public void Resolve_ProfileDirMissing_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--profile", "no-such-dir", "--output", "out" });
+        Assert.NotNull(r.Error);
+    }
+
+    [Fact]
+    public void Resolve_UnknownOption_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--config", "c.json", "--output", "out", "--weird", "x" });
+        Assert.NotNull(r.Error);
+    }
+
+    [Fact]
+    public void Resolve_ExtraPositionalArg_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--config", "c.json", "--output", "out", "extra" });
+        Assert.NotNull(r.Error);
+    }
+
+    [Fact]
+    public void Resolve_FlagMissingValue_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(new[] { "--config", "--output", "out" });
+        Assert.NotNull(r.Error);
+    }
+
+    [Fact]
+    public void Resolve_ExpectedTotal_ParsedOnSuccess()
+    {
+        string profile = MakeProfile();
+        try
+        {
+            ConvertResolution r = ConvertInput.Resolve(
+                new[] { "--profile", profile, "--output", "out", "--expected-total", "42" });
+            Assert.Null(r.Error);
+            Assert.Equal(42, r.ExpectedTotal);
+        }
+        finally { Directory.Delete(profile, true); }
+    }
+
+    [Fact]
+    public void Resolve_NoExpectedTotal_DefaultsToMinusOne()
+    {
+        string profile = MakeProfile();
+        try
+        {
+            ConvertResolution r = ConvertInput.Resolve(new[] { "--profile", profile, "--output", "out" });
+            Assert.Null(r.Error);
+            Assert.Equal(-1, r.ExpectedTotal);   // sentinel -> count on demand
+        }
+        finally { Directory.Delete(profile, true); }
+    }
+
+    [Fact]
+    public void Resolve_NonNumericExpectedTotal_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(
+            new[] { "--config", "c.json", "--output", "out", "--expected-total", "notanumber" });
+        Assert.NotNull(r.Error);
+        Assert.Contains("expected-total", r.Error!);
+    }
+
+    [Fact]
+    public void Resolve_NegativeExpectedTotal_Error()
+    {
+        ConvertResolution r = ConvertInput.Resolve(
+            new[] { "--config", "c.json", "--output", "out", "--expected-total", "-5" });
+        Assert.NotNull(r.Error);
+    }
+
+    /// <summary>
+    /// Should-fix (SF-C): --no-contacts must be honored in explicit --config mode (it was silently
+    /// ignored there while --no-tasks/--no-appointments were honored). Contact sources are stripped.
+    /// </summary>
+    [Fact]
+    public void Resolve_ConfigWithNoContacts_StripsContactSources()
+    {
+        string cfg = Path.Combine(Path.GetTempPath(), "mail2pst-nc-" + Guid.NewGuid() + ".json");
+        File.WriteAllText(cfg,
+            "{\"outputs\":[{\"name\":\"Out\",\"sources\":[]," +
+            "\"contacts\":[{\"path\":\"abook.sqlite\",\"format\":\"thunderbird-sqlite\"}]}]}");
+        try
+        {
+            ConvertResolution with = ConvertInput.Resolve(new[] { "--config", cfg, "--output", "out" });
+            Assert.Null(with.Error);
+            Assert.Single(with.Config!.Outputs[0].Contacts);   // present without the flag
+
+            ConvertResolution without = ConvertInput.Resolve(new[] { "--config", cfg, "--output", "out", "--no-contacts" });
+            Assert.Null(without.Error);
+            Assert.Empty(without.Config!.Outputs[0].Contacts);  // stripped by --no-contacts
+        }
+        finally { File.Delete(cfg); }
+    }
+}
