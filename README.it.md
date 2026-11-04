@@ -1,80 +1,89 @@
-# MboxPort 1.0.1
+# MboxPort
 
-Applicazione desktop libera per Windows 10/11 x64 che converte **un file MBOX alla volta in PST Unicode**, senza Microsoft Outlook. Interfaccia WPF in italiano, conversione locale, nessun account o upload.
+**Conversione gratuita e locale da MBOX a PST per Windows. Non richiede Outlook.**
+
+[English](README.md) · [Italiano](README.it.md) · [简体中文](README.zh-Hans.md) · [हिन्दी](README.hi.md) · [Español](README.es.md) · [العربية](README.ar.md) · [Français](README.fr.md) · [বাংলা](README.bn.md) · [Português](README.pt.md) · [Bahasa Indonesia](README.id.md)
+
+[Modifiche](CHANGELOG.md) · [Licenza](LICENSE) · [Attribuzioni di terze parti](THIRD_PARTY.md)
+
+[Scarica l'ultima versione](https://github.com/VenomDrake/MBoxPort/releases/latest)
+
+MboxPort converte un archivio MBOX standard alla volta in file PST Unicode. Messaggi e allegati rimangono sul computer. L'applicazione Windows include il proprio runtime .NET.
 
 ## Utilizzo
 
-1. Installa `MboxPort-1.0.1-Setup-x64.exe`, se disponibile, oppure estrai la versione portatile e avvia `MboxPort.exe`.
-2. Premi **Scegli file** o trascina un MBOX nella finestra. Sono selezionabili anche archivi senza estensione.
-3. Scegli una cartella esistente di destinazione.
-4. Scegli parti PST da circa **10, 20 o 40 GiB** (nell'interfaccia indicate come GB). Il valore predefinito è 20.
-5. Premi **Converti in PST**. Il programma mostra prima l'analisi in byte, poi l'avanzamento per messaggi.
-6. Apri i risultati e consulta `rapporto.txt` e `rapporto-dettagliato.json`.
+1. Estrai l'intero archivio `MboxPort-1.0.1-Portatile-x64.zip` e avvia `MboxPort.exe`, oppure usa l'installer quando disponibile.
+2. Scegli un file oppure trascina un MBOX nella finestra. Sono supportati anche archivi senza estensione.
+3. Seleziona una cartella di destinazione esistente e una dimensione indicativa per le parti PST: 10, 20 o 40 GiB.
+4. Avvia la conversione. Ogni esecuzione crea una propria cartella dei risultati.
+5. Apri i risultati e leggi il rapporto prima di utilizzare un archivio con avvisi o messaggi saltati.
 
-Ogni esecuzione crea una sottocartella distinta. Il file di origine viene aperto in sola lettura e rimane bloccato contro modifiche durante la conversione. Messaggi e allegati non vengono caricati tutti insieme in memoria. Le parti PST vengono rilette dal motore per verificare il conteggio prima di dichiarare il completamento.
+Richiede Windows 10/11 x64. L'eseguibile non è firmato digitalmente.
 
-La versione 1.0.1 interrompe la conversione se non riesce a completare la lettura della sorgente. Confronta inoltre i messaggi rilevati con quelli salvati e saltati prima di annunciare il completamento. Il rapporto di una conversione annullata distingue i messaggi effettivamente salvati nei PST conservati da quelli eliminati con la parte incompleta. Vedi `CHANGELOG.md`.
+## Lingue
+
+Il selettore offre **10 lingue**, compreso l'italiano. La scelta iniziale segue la lingua del sistema quando supportata; altrimenti viene usato l'inglese. La lingua scelta viene ricordata localmente.
+
+| Lingua | Codice |
+| --- | --- |
+| English | `en` |
+| Italiano | `it` |
+| 简体中文 | `zh-Hans` |
+| हिन्दी | `hi` |
+| Español | `es` |
+| العربية | `ar` |
+| Français | `fr` |
+| বাংলা | `bn` |
+| Português | `pt` |
+| Bahasa Indonesia | `id` |
+
+L'interfaccia, i messaggi applicativi e il rapporto di conversione leggibile usano la lingua selezionata. L'arabo dispone di un'interfaccia da destra a sinistra. I dettagli diagnostici del motore e del sistema operativo possono rimanere nella lingua originale. I nomi delle proprietà JSON e dei file di rapporto rimangono invariati tra le lingue.
+
+## Risultati e annullamento
+
+- I PST vengono divisi automaticamente. La dimensione scelta è indicativa: lo spazio aggiuntivo richiesto dal formato e un singolo messaggio grande possono farla superare.
+- `rapporto.txt` è il rapporto leggibile; `rapporto-dettagliato.json` contiene i dettagli del motore; `sessione.json` registra lo stato della sessione e i contatori finali.
+- Un errore di lettura della sorgente interrompe la conversione. Le parti PST già complete possono rimanere disponibili, ma costituiscono risultati parziali.
+- L'annullamento elimina il PST incompleto in corso e conserva le parti precedenti già completate. Il conteggio dei messaggi salvati riguarda solo i file conservati; i messaggi eliminati con la parte incompleta sono indicati separatamente.
+- L'applicazione controlla il conteggio finale dei messaggi e riapre i PST completati per verificare il numero di elementi memorizzati. Questi controlli non garantiscono la resa visiva di ogni messaggio in Outlook.
+- Ogni conversione legge l'origine senza modificarla. Non è prevista la ripresa automatica.
 
 ## Compatibilità e limiti
 
-- MBOX standard con separatori `From ` e messaggi MIME: adatto a esportazioni standard da Thunderbird, Gmail Takeout, Apple Mail, Aruba e altri fornitori. Il fornitore non determina il formato: le varianti non standard vanno verificate con un campione.
-- Un MBOX può superare 20 GiB: non esiste un limite di 20 GiB sul file di ingresso; vengono usati flussi e offset a 64 bit. I PST si dividono automaticamente. La dimensione selezionata è indicativa, non un limite fisico rigoroso: overhead e singoli messaggi possono farla superare.
-- Conservazione di testo, HTML, destinatari A/Cc/Ccn, date, intestazioni e allegati tramite il motore ContinuMail. Gli errori sui singoli messaggi vengono riportati; non vengono nascosti dietro un esito senza avvisi.
-- Solo email: questa interfaccia non importa contatti, calendari o profili Thunderbird completi. Le cartelle del profilo, le etichette Gmail e gli stati contenuti soltanto negli indici `.msf` non vengono ricostruiti da un MBOX isolato. La cartella PST si chiama `Posta importata`.
-- L'involucro MBOX deve essere ASCII/UTF-8 compatibile e iniziare con `From `; i charset dei corpi MIME sono decodificati dal motore. MBOX UTF-16, file corrotti, archivi compressi e formati proprietari richiedono un'esportazione standard prima della conversione.
-- Il motore salta messaggi individuali oltre circa 1900 MiB e segnala il salto. Tale limite riguarda un messaggio, non l'intero archivio.
-- Annullamento durante l'analisi: nessun PST viene creato. Durante la scrittura, il motore elimina la parte in corso e conserva le eventuali parti già completate, elencandole nel rapporto. Il conteggio finale dei messaggi salvati riguarda solo le parti conservate; i messaggi della parte eliminata hanno un contatore separato. L'annullamento può attendere la conclusione dell'operazione corrente su un messaggio molto grande. Non è prevista la ripresa automatica.
-- Se la lettura della sorgente si interrompe, l'esito è un errore e gli eventuali PST conservati sono parziali. Quando il disco consente di scriverli, i rapporti spiegano l'errore e le parti disponibili. Il percorso dei risultati rimane accessibile anche se la scrittura del file diagnostico fallisce.
-- Occorre spazio libero per i PST e per i temporanei degli allegati. Per archivi grandi usare NTFS o exFAT; FAT32 limita i singoli file a circa 4 GiB.
-- L'installer è privo di firma digitale; può essere segnalato come autore non verificato da Windows. Nessun certificato di firma è stato acquistato o incluso.
+Questa interfaccia importa soltanto email MBOX/MIME standard. Estrai le esportazioni compresse prima di selezionare il MBOX. Le varianti specifiche dei fornitori richiedono una prova su un campione. Un MBOX isolato non contiene necessariamente struttura delle cartelle, etichette, stati di lettura, contatti o calendari dell'origine.
 
-## Compilazione
+I file di ingresso possono superare 20 GiB, ma non è stata convalidata una conversione reale completa oltre 20 GiB. I singoli messaggi superiori a circa 1900 MiB vengono saltati e riportati. L'analisi di messaggi grandi può richiedere molta memoria e l'annullamento può attendere la conclusione dell'operazione di analisi corrente. Prevedi spazio sia per i PST sia per gli allegati temporanei. Usa un filesystem che supporti file grandi.
 
-Richiede Windows x64, .NET SDK 8.0.427 (o una patch successiva ammessa da `global.json`) e accesso a NuGet per il primo ripristino. L'applicazione distribuita è autonoma e include il runtime .NET: chi la usa non deve installare Python, Node, Outlook o .NET separatamente.
+## Compilazione dai sorgenti
+
+Richiede Windows x64, .NET SDK **8.0.427** o una patch successiva ammessa da `global.json`, e accesso a NuGet per il primo ripristino.
 
 ```powershell
 ./build.ps1
 ```
 
-Lo script cerca automaticamente Inno Setup nelle posizioni comuni. Per indicare un compilatore esplicito e produrre anche l'installer:
+Lo script esegue ripristini bloccati per `win-x64`, pubblica l'applicazione autonoma in una cartella temporanea pulita, esegue i test applicativi e i test di regressione selezionati del motore, quindi converte 240 messaggi sintetici. Crea gli ZIP dei sorgenti e della versione portatile e `SHA256SUMS.txt` in `artifacts/`. Quando disponibile, Inno Setup viene usato per creare un installer:
 
 ```powershell
-./build.ps1 -InnoCompiler 'C:\percorso\Inno Setup 6\ISCC.exe'
+./build.ps1 -InnoCompiler 'C:\path\to\Inno Setup 6\ISCC.exe'
 ```
 
-L'output è in `artifacts/`. Lo script ripristina le dipendenze in modalità bloccata, compila e verifica il programma, quindi genera i sorgenti completi, la versione portatile e, se Inno Setup è disponibile, l'installer. `SHA256SUMS.txt` contiene gli hash dei pacchetti prodotti. La cartella di pubblicazione viene ricreata a ogni esecuzione per escludere file residui. I sorgenti di ContinuMail e del suo motore PST sono inclusi nel repository.
+Nome e versione del prodotto sono definiti in `src/Directory.Build.props`. Sono inclusi i sorgenti completi di ContinuMail e del relativo motore PST. Le versioni delle dipendenze NuGet sono registrate nei file di blocco. Gli strumenti di compilazione e i pacchetti NuGet non sono inclusi come SDK per la compilazione offline.
 
-La versione dell'applicazione è definita in `src/Directory.Build.props`; il programma, i rapporti e i nomi dei pacchetti derivano da quel valore. I restore di app, test e SmokeTest usano tutti `win-x64`, così i lock dei progetti condivisi restano coerenti.
-
-## Test
-
-`build.ps1` esegue i test applicativi, i test selezionati del motore e una conversione sintetica. I comandi seguenti consentono di ripetere i controlli dopo il ripristino delle dipendenze eseguito dallo script.
+Dopo che `build.ps1` ha ripristinato le dipendenze, è possibile eseguire singolarmente i controlli seguenti:
 
 ```powershell
 dotnet test tests/PostaBridge.Tests/PostaBridge.Tests.csproj -c Release -r win-x64 --no-restore
 dotnet build third_party/ContinuMail/src/Mail2Pst.Cli/Mail2Pst.Cli.csproj -c Release --no-restore
 dotnet test third_party/ContinuMail/tests/Mail2Pst.Core.Tests/Mail2Pst.Core.Tests.csproj -c Release -r win-x64 --no-restore
-dotnet run --project tools/SmokeTest/SmokeTest.csproj -c Release -r win-x64 --no-restore -- artifacts/smoke
 ```
 
-Verifica indipendente opzionale, con Python 3.12+ e `pip install pypstreader==1.0.0`:
+La compilazione separata della CLI fornisce il percorso previsto dai test end-to-end upstream. Non modifica la configurazione di ripristino dell'applicazione. Consulta `VALIDAZIONE.txt` per le prove effettivamente eseguite e i relativi limiti.
 
-```powershell
-python tools/verify_independent.py artifacts/smoke
-```
-
-Lo SmokeTest genera soltanto posta sintetica: 240 messaggi in più parti PST. Lo script Python opzionale rilegge quei file con un'implementazione indipendente e verifica allegati byte per byte, HTML, Unicode, destinatari e Message-ID. I test di regressione coprono inoltre errori di lettura e contatori dopo l'annullamento. Vedi `VALIDAZIONE.txt` per le prove effettivamente eseguite e i loro limiti.
+È incluso uno script facoltativo di rilettura indipendente in `tools/verify_independent.py`. Richiede Python 3.12+ e `pypstreader==1.0.0` e opera sui risultati sintetici dello SmokeTest.
 
 ## Provenienza e licenza
 
-MboxPort (in precedenza PostaBridge) è un'integrazione derivata indipendente basata sul motore [ContinuMail](https://github.com/ContinuMail/continumail-converter), non un nuovo motore PST implementato da zero. Il codice del motore include [PSTFileFormat](https://github.com/ROM-Knowledgeware/PSTFileFormat) sotto LGPL. La nuova interfaccia e l'integrazione sono distribuite con **GNU GPL v3 o successiva**, senza garanzia.
+MboxPort si chiamava in precedenza **PostaBridge**. È un'integrazione indipendente basata su [ContinuMail](https://github.com/ContinuMail/continumail-converter), con [PSTFileFormat](https://github.com/ROM-Knowledgeware/PSTFileFormat). È distribuito secondo la **GNU GPL versione 3 o successiva**, senza garanzia. La libreria PST mantiene le proprie condizioni LGPL. Le informazioni sul copyright, le licenze e le attribuzioni esistenti sono conservate in [THIRD_PARTY.md](THIRD_PARTY.md) e nei sorgenti upstream inclusi.
 
-Vedi `LICENSE`, `THIRD_PARTY.md` e `third_party/ContinuMail/NOTICE`. La copia sorgente include il motore, le modifiche, gli script di build e i test. È possibile modificare anche il componente LGPL e ricompilare il programma.
-
-Fonti tecniche consultate il 20 ottobre 2026:
-
-- [ContinuMail: supporto, limiti e build](https://github.com/ContinuMail/continumail-converter).
-- [libpff: accesso ai file PFF](https://github.com/libyal/libpff).
-- [Microsoft: AddStoreEx](https://learn.microsoft.com/en-us/office/vba/api/outlook.namespace.addstoreex), valutato e scartato perché richiederebbe Outlook.
-- [pypstreader: lettore indipendente](https://pypi.org/project/pypstreader/).
-- [Formato PST Microsoft](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/).
+Gli archivi delle release includono i sorgenti corrispondenti e gli avvisi di licenza.

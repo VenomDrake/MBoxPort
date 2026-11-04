@@ -62,6 +62,7 @@ function New-TaskZip([string]$Source, [string]$Destination, [bool]$SourceOnly) {
 
 Push-Location $taskRoot
 try {
+    & (Join-Path $taskRoot 'tools/Verify-Readmes.ps1') -ProjectRoot $taskRoot
     $taskSdk = & $Dotnet --version
     if ($LASTEXITCODE -ne 0) { throw 'SDK .NET richiesto da global.json non disponibile.' }
     Write-Host "$taskProduct $taskVersion — SDK .NET $taskSdk — win-x64"
@@ -73,7 +74,8 @@ try {
     if ($BuildOutput) { $taskBuildArgs += "-p:BaseOutputPath=$BuildOutput" }
     Invoke-TaskDotnet $taskBuildArgs
     Copy-Item -LiteralPath (Join-Path $taskRoot 'GUIDA.txt'), (Join-Path $taskRoot 'VALIDAZIONE.txt') -Destination $taskPublish -Force
-    Copy-Item -LiteralPath (Join-Path $taskRoot 'README.md'), (Join-Path $taskRoot 'README.it.md'), (Join-Path $taskRoot 'CHANGELOG.md'), (Join-Path $taskRoot 'LICENSE'), (Join-Path $taskRoot 'THIRD_PARTY.md') -Destination $taskPublish -Force
+    Get-ChildItem -LiteralPath $taskRoot -Filter 'README*.md' -File | Copy-Item -Destination $taskPublish -Force
+    Copy-Item -LiteralPath (Join-Path $taskRoot 'CHANGELOG.md'), (Join-Path $taskRoot 'LICENSE'), (Join-Path $taskRoot 'THIRD_PARTY.md') -Destination $taskPublish -Force
     & (Join-Path $taskRoot 'tools/Collect-Licenses.ps1') -PublishPath $taskPublish
 
     Invoke-TaskDotnet @('restore', 'tests/PostaBridge.Tests/PostaBridge.Tests.csproj', '-r', 'win-x64', '--locked-mode')

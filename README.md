@@ -2,7 +2,9 @@
 
 **Free, local MBOX to PST conversion for Windows. No Outlook required.**
 
-[Italiano](README.it.md) · [Changes](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY.md)
+[English](README.md) · [Italiano](README.it.md) · [简体中文](README.zh-Hans.md) · [हिन्दी](README.hi.md) · [Español](README.es.md) · [العربية](README.ar.md) · [Français](README.fr.md) · [বাংলা](README.bn.md) · [Português](README.pt.md) · [Bahasa Indonesia](README.id.md)
+
+[Changes](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY.md)
 
 [Download the latest release](https://github.com/VenomDrake/MBoxPort/releases/latest)
 
